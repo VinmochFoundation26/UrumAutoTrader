@@ -30,11 +30,13 @@ jobs:
         run: tar -czf /tmp/backend-dist.tar.gz -C backend dist/
 
       - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 147.93.61.250 >> ~/.ssh/known_hosts
+          ssh-keyscan -H 147.93.61.250 >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Upload dist to server
         run: scp -i ~/.ssh/deploy_key /tmp/backend-dist.tar.gz root@147.93.61.250:/tmp/
