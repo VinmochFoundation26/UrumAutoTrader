@@ -50,3 +50,4 @@ jobs:
             sleep 5
             docker exec autotrader-backend-1 wget -qO- http://localhost:5050/health
           ENDSSH
+# triggered
