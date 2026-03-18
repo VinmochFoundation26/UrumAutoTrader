@@ -1,0 +1,50 @@
+name: Deploy Backend to VPS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build TypeScript
+        working-directory: backend
+        run: npm run build
+
+      - name: Package dist
+        run: tar -czf /tmp/backend-dist.tar.gz -C backend dist/
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 147.93.61.250 >> ~/.ssh/known_hosts
+
+      - name: Upload dist to server
+        run: scp -i ~/.ssh/deploy_key /tmp/backend-dist.tar.gz root@147.93.61.250:/tmp/
+
+      - name: Deploy on server
+        run: |
+          ssh -i ~/.ssh/deploy_key root@147.93.61.250 << 'ENDSSH'
+            tar -xzf /tmp/backend-dist.tar.gz -C /tmp/
+            docker cp /tmp/dist/. autotrader-backend-1:/app/dist/
+            docker restart autotrader-backend-1
+            sleep 5
+            docker exec autotrader-backend-1 wget -qO- http://localhost:5050/health
+          ENDSSH
