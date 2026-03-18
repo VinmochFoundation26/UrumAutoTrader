@@ -36,14 +36,14 @@ jobs:
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 147.93.61.250 >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -p 2222 -H 147.93.61.250 >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Upload dist to server
-        run: scp -i ~/.ssh/deploy_key /tmp/backend-dist.tar.gz root@147.93.61.250:/tmp/
+        run: scp -P 2222 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no /tmp/backend-dist.tar.gz root@147.93.61.250:/tmp/
 
       - name: Deploy on server
         run: |
-          ssh -i ~/.ssh/deploy_key root@147.93.61.250 << 'ENDSSH'
+          ssh -p 2222 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no root@147.93.61.250 << 'ENDSSH'
             tar -xzf /tmp/backend-dist.tar.gz -C /tmp/
             docker cp /tmp/dist/. autotrader-backend-1:/app/dist/
             docker restart autotrader-backend-1
