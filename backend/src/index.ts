@@ -1,0 +1,1358 @@
+import "dotenv/config";
+import http from "node:http";
+import { URL } from "node:url";
+import { v4 as uuidv4 } from "uuid";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+
+import {
+  createUser, getUserById, getUserByEmail, getUserByVerifyToken,
+  updateUser, listAllUsers, deleteUser, seedAdminIfEmpty,
+} from "./services/users/userStore.js";
+import {
+  sendVerificationEmail, sendApprovalEmail, sendRejectionEmail,
+  sendAdminNewUserAlert,
+} from "./services/email/mailer.js";
+
+import { log } from "./logger.js";
+import { connectRedis, disconnectRedis, getRedis } from "./services/cache/redis.js";
+import { restoreEventHistory } from "./services/bot/state.js";
+import { startPriceStream, stopPriceStream, getLatestPrice, getAllPrices, updateStreamSymbols } from "./services/market/priceStream.js";
+import { assertOnchainReady, getVaultReadContract } from "./services/onchain/contractInstance.js";
+import { startEngine, stopEngine } from "./services/bot/runner.js";
+import { getState, setRunning, recordError, addSseClient, getEventHistory } from "./services/bot/state.js";
+import { getVaultBalances } from "./services/onchain/vaultViews.js";
+import { validateConfig, CFG_KEYS, symbolMaxLev } from "./botWorker.trend_range_fork.js";
+import { closePositionVaultV2, depositStableToVault, withdrawStableFromVault, emergencyWithdrawFromVault, getWalletStableBalance } from "./services/onchain/vaultAdapter.js";
+import { getSigner, getVaultWriteContract, getProvider, getVaultAddress } from "./services/onchain/contractInstance.js";
+import { recordDeposit, recordWithdrawal, recordSubscriptionPayment, checkSubscription, getUserFeeStats, FEE } from "./services/fees/feeEngine.js";
+import { workerPool } from "./services/bot/workerPool.js";
+import { getCandleCacheStats } from "./services/market/binanceCandles.js";
+
+const PORT                = Number(process.env.PORT ?? "5050");
+const ADMIN_KEY           = process.env.ADMIN_KEY ?? "";               // kept for internal CLI only
+const ALLOWED_ORIGIN      = process.env.CORS_ORIGIN ?? "*";
+const JWT_SECRET          = process.env.JWT_SECRET ?? "CHANGEME_REPLACE_BEFORE_LAUNCH";
+const LOGIN_PASSWORD_HASH = process.env.LOGIN_PASSWORD_HASH ?? "";
+const JWT_EXPIRES_IN      = "8h";
+const ADMIN_EMAIL         = process.env.ADMIN_EMAIL ?? "";
+
+// ── In-memory rate limiter (login endpoint) ───────────────────────────────────
+const _rlMap = new Map<string, { count: number; resetAt: number }>();
+function checkRateLimit(ip: string, max = 10): boolean {
+  const now = Date.now();
+  const e   = _rlMap.get(ip) ?? { count: 0, resetAt: now + 60_000 };
+  if (now > e.resetAt) { e.count = 0; e.resetAt = now + 60_000; }
+  e.count++;
+  _rlMap.set(ip, e);
+  return e.count <= max;
+}
+
+// Clean up stale rate-limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _rlMap) if (now > v.resetAt) _rlMap.delete(k);
+}, 5 * 60_000).unref();
+
+// Prefer TEST_USER_ADDRESS, but keep TEST_USER_KEY for backward compatibility
+let currentUserAddress = process.env.TEST_USER_ADDRESS ?? process.env.TEST_USER_KEY ?? "";
+
+// Source of truth: SYMBOLS only (no whitelist)
+let currentSymbols: string[] = (process.env.SYMBOLS ?? "ETHUSDT")
+  .split(",")
+  .map((s) => s.trim().toUpperCase())
+  .filter(Boolean);
+
+// Fork-only strategy (prevent config drift)
+const currentStrategy = "trend_range_fork" as const;
+
+// Trigger params (fork uses these for stoch settings)
+let currentTrigger = {
+  stochOS: Number(process.env.STOCH_OS ?? "20"),
+  stochOB: Number(process.env.STOCH_OB ?? "80"),
+  stochMid: Number(process.env.STOCH_MID ?? "50"),
+  stochDLen: Number(process.env.STOCH_D_LEN ?? "3"),
+};
+
+// Redis key for persisting engine run state across restarts
+const REDIS_ENGINE_KEY = "bot:engine:autostart";
+
+async function persistEngineState(running: boolean) {
+  try {
+    const redis = getRedis();
+    if (running) {
+      await redis.set(REDIS_ENGINE_KEY, JSON.stringify({
+        running: true,
+        userKey: currentUserAddress,
+        symbols: currentSymbols,
+        trigger: currentTrigger,
+        savedAt: Date.now(),
+      }));
+    } else {
+      await redis.del(REDIS_ENGINE_KEY);
+    }
+  } catch { /* non-fatal */ }
+}
+
+async function startBot(args: { userKey: string; symbols: string[]; trigger?: typeof currentTrigger }) {
+  return await startEngine(args);
+}
+function stopBot() {
+  return stopEngine();
+}
+
+function normalizeSymbols(list: any): string[] {
+  const arr = Array.isArray(list)
+    ? list
+    : typeof list === "string"
+      ? list.split(",")
+      : [];
+  return arr.map((s: any) => String(s).trim().toUpperCase()).filter(Boolean);
+}
+
+function setCors(res: http.ServerResponse) {
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+}
+
+function json(res: http.ServerResponse, status: number, body: any) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
+}
+
+/** Decode and verify JWT — returns payload or null */
+function decodeToken(req: http.IncomingMessage): { userId?: string; role?: string; jti?: string } | null {
+  const auth = String(req.headers["authorization"] ?? "");
+  if (!auth.startsWith("Bearer ")) return null;
+  try { return jwt.verify(auth.slice(7), JWT_SECRET) as any; }
+  catch { return null; }
+}
+
+/** JWT bearer auth — used by all protected endpoints */
+function requireAuth(req: http.IncomingMessage): string | null {
+  return decodeToken(req) ? null : "unauthorized";
+}
+
+/** Check that session:{jti} key exists in Redis (revocation support) */
+async function checkSession(jti: string | undefined): Promise<boolean> {
+  if (!jti) return false;
+  try { return (await getRedis().exists(`session:${jti}`)) === 1; }
+  catch { return true; } // Redis failure → non-blocking, allow
+}
+
+/** Require admin role in JWT + valid session */
+async function requireAdminRole(req: http.IncomingMessage): Promise<{ error: string } | { userId: string; jti: string; role: string }> {
+  const payload = decodeToken(req);
+  if (!payload) return { error: "unauthorized" };
+  if (payload.role !== "admin" && payload.role !== "support") return { error: "forbidden" };
+  if (!(await checkSession(payload.jti))) return { error: "session expired" };
+  return { userId: payload.userId ?? "", jti: payload.jti ?? "", role: payload.role };
+}
+
+/** Write an audit log entry (admin actions) */
+async function auditLog(adminId: string, action: string, targetUserId: string, details?: string) {
+  try {
+    const entry = JSON.stringify({ ts: Date.now(), adminId, action, targetUserId, details: details ?? "" });
+    await getRedis().lpush("audit:log", entry);
+    await getRedis().ltrim("audit:log", 0, 9999);
+  } catch { /* non-fatal */ }
+}
+
+/** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
+function requireAdmin(req: http.IncomingMessage) {
+  if (!ADMIN_KEY) return null;
+  const key = String(req.headers["x-admin-key"] ?? "");
+  if (!key || key !== ADMIN_KEY) return "unauthorized";
+  return null;
+}
+
+async function readJson(req: http.IncomingMessage) {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c)));
+  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  return raw ? JSON.parse(raw) : {};
+}
+
+http
+  .createServer(async (req, res) => {
+    setCors(res);
+    if (req.method === "OPTIONS") return res.end();
+
+    try {
+      const u = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+
+      if (u.pathname === "/health") {
+        let redisOk = false;
+        try { await getRedis().ping(); redisOk = true; } catch { /* non-fatal */ }
+        return json(res, 200, {
+          ok: true,
+          version: "1.0.0",
+          uptime: Math.floor(process.uptime()),
+          redis: redisOk ? "ok" : "degraded",
+          bot: getState().running ? "running" : "stopped",
+          ts: Date.now(),
+        });
+      }
+
+      // ── POST /auth/login ── JWT login (rate-limited, 10 attempts/min/IP) ──────
+      if (u.pathname === "/auth/login" && req.method === "POST") {
+        const ip = req.socket?.remoteAddress ?? "unknown";
+        if (!checkRateLimit(ip)) {
+          log.warn({ ip }, "[auth] rate limit exceeded on /auth/login");
+          return json(res, 429, { ok: false, error: "Too many login attempts. Try again in a minute." });
+        }
+        try {
+          const b        = await readJson(req);
+          const password = String(b.password ?? "").trim();
+          const email    = String(b.email ?? "").trim().toLowerCase();
+
+          if (!password) return json(res, 401, { ok: false, error: "Invalid credentials" });
+
+          const redis = getRedis();
+
+          // ── Multi-user path: email + password ────────────────────────────────
+          if (email) {
+            // Seed admin on first-ever login if users:list is empty
+            if (LOGIN_PASSWORD_HASH && ADMIN_EMAIL) {
+              await seedAdminIfEmpty(redis, ADMIN_EMAIL, LOGIN_PASSWORD_HASH);
+            }
+
+            const user = await getUserByEmail(redis, email);
+            if (!user) {
+              log.warn({ ip, email }, "[auth] login: user not found");
+              return json(res, 401, { ok: false, error: "Invalid credentials" });
+            }
+            const valid = await bcrypt.compare(password, user.passwordHash);
+            if (!valid) {
+              log.warn({ ip, email }, "[auth] login: wrong password");
+              return json(res, 401, { ok: false, error: "Invalid credentials" });
+            }
+            if (user.status === "pending_email") {
+              return json(res, 403, { ok: false, error: "Please verify your email first." });
+            }
+            if (user.status === "pending_approval") {
+              return json(res, 403, { ok: false, error: "Your account is pending admin approval.", status: "pending_approval" });
+            }
+            if (user.status === "suspended") {
+              return json(res, 403, { ok: false, error: "Your account has been suspended." });
+            }
+
+            const jti = uuidv4();
+            const token = jwt.sign(
+              { userId: user.id, role: user.role, jti },
+              JWT_SECRET,
+              { expiresIn: JWT_EXPIRES_IN }
+            );
+            await redis.set(`session:${jti}`, user.id, "EX", 8 * 3600);
+            await auditLog(user.id, "login", user.id);
+            log.info({ ip, email, role: user.role }, "[auth] login successful");
+            return json(res, 200, { ok: true, token, expiresIn: JWT_EXPIRES_IN, role: user.role, userId: user.id });
+          }
+
+          // ── Legacy path: password-only (existing admin dashboard) ────────────
+          if (!LOGIN_PASSWORD_HASH) return json(res, 401, { ok: false, error: "Invalid credentials" });
+          const valid = await bcrypt.compare(password, LOGIN_PASSWORD_HASH);
+          if (!valid) {
+            log.warn({ ip }, "[auth] failed legacy login attempt");
+            return json(res, 401, { ok: false, error: "Invalid credentials" });
+          }
+          // Seed admin user and resolve userId for JWT
+          if (LOGIN_PASSWORD_HASH && ADMIN_EMAIL) {
+            await seedAdminIfEmpty(redis, ADMIN_EMAIL, LOGIN_PASSWORD_HASH);
+          }
+          const adminUser = ADMIN_EMAIL ? await getUserByEmail(redis, ADMIN_EMAIL) : null;
+          const jti = uuidv4();
+          const token = jwt.sign(
+            { userId: adminUser?.id ?? "admin", role: "admin", jti },
+            JWT_SECRET,
+            { expiresIn: JWT_EXPIRES_IN }
+          );
+          await redis.set(`session:${jti}`, adminUser?.id ?? "admin", "EX", 8 * 3600);
+          log.info({ ip }, "[auth] legacy admin login successful — token issued (8h)");
+          return json(res, 200, { ok: true, token, expiresIn: JWT_EXPIRES_IN, role: "admin" });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── POST /auth/refresh ── extend session without re-entering password ────
+      if (u.pathname === "/auth/refresh" && req.method === "POST") {
+        const payload = decodeToken(req);
+        if (!payload) return json(res, 401, { ok: false, error: "unauthorized" });
+        const jti = uuidv4();
+        const token = jwt.sign(
+          { userId: payload.userId, role: payload.role ?? "admin", jti },
+          JWT_SECRET,
+          { expiresIn: JWT_EXPIRES_IN }
+        );
+        // Revoke old session, start new one
+        if (payload.jti) await getRedis().del(`session:${payload.jti}`);
+        await getRedis().set(`session:${jti}`, payload.userId ?? "admin", "EX", 8 * 3600);
+        return json(res, 200, { ok: true, token, expiresIn: JWT_EXPIRES_IN });
+      }
+
+      // ── POST /auth/register ─────────────────────────────────────────────────
+      if (u.pathname === "/auth/register" && req.method === "POST") {
+        const ip = req.socket?.remoteAddress ?? "unknown";
+        if (!checkRateLimit(ip, 5)) {
+          return json(res, 429, { ok: false, error: "Too many registration attempts. Try again in a minute." });
+        }
+        try {
+          const b = await readJson(req);
+          const email         = String(b.email ?? "").trim().toLowerCase();
+          const password      = String(b.password ?? "").trim();
+          const walletAddress = String(b.walletAddress ?? "").trim();
+
+          if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+            return json(res, 400, { ok: false, error: "Valid email required" });
+          if (!password || password.length < 8)
+            return json(res, 400, { ok: false, error: "Password must be at least 8 characters" });
+          if (!walletAddress || !/^0x[0-9a-fA-F]{40}$/.test(walletAddress))
+            return json(res, 400, { ok: false, error: "Valid wallet address required" });
+
+          const redis = getRedis();
+          const existing = await getUserByEmail(redis, email);
+          if (existing) return json(res, 409, { ok: false, error: "Email already registered" });
+
+          const passwordHash = await bcrypt.hash(password, 12);
+          const user = await createUser(redis, { email, passwordHash, walletAddress });
+          await sendVerificationEmail(user.email, user.emailVerifyToken);
+          log.info({ email, userId: user.id }, "[auth] new user registered");
+          return json(res, 201, { ok: true, message: "Registration successful. Check your email to verify your address." });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── GET /auth/verify-email?token=xxx ────────────────────────────────────
+      if (u.pathname === "/auth/verify-email" && req.method === "GET") {
+        const token = u.searchParams.get("token") ?? "";
+        if (!token) return json(res, 400, { ok: false, error: "Missing token" });
+        const redis = getRedis();
+        const user = await getUserByVerifyToken(redis, token);
+        if (!user) return json(res, 400, { ok: false, error: "Invalid or expired verification link" });
+        if (user.status !== "pending_email") return json(res, 400, { ok: false, error: "Email already verified" });
+        await updateUser(redis, user.id, { status: "pending_approval", emailVerifyToken: "" });
+        await sendAdminNewUserAlert(user.email);
+        log.info({ email: user.email }, "[auth] email verified — pending approval");
+        return json(res, 200, { ok: true, message: "Email verified. Your application is under review." });
+      }
+
+      // ── GET /auth/me ─────────────────────────────────────────────────────────
+      if (u.pathname === "/auth/me" && req.method === "GET") {
+        const payload = decodeToken(req);
+        if (!payload?.userId) return json(res, 401, { ok: false, error: "unauthorized" });
+        const user = await getUserById(getRedis(), payload.userId);
+        if (!user) return json(res, 404, { ok: false, error: "user not found" });
+        const { passwordHash: _, emailVerifyToken: __, ...safe } = user;
+        return json(res, 200, { ok: true, user: safe });
+      }
+
+      // ── POST /auth/wallet ── link/update wallet after MetaMask sign ──────────
+      if (u.pathname === "/auth/wallet" && req.method === "POST") {
+        const payload = decodeToken(req);
+        if (!payload?.userId) return json(res, 401, { ok: false, error: "unauthorized" });
+        try {
+          const b = await readJson(req);
+          const walletAddress = String(b.walletAddress ?? "").trim();
+          if (!walletAddress || !/^0x[0-9a-fA-F]{40}$/.test(walletAddress))
+            return json(res, 400, { ok: false, error: "Valid wallet address required" });
+          // Verify signature if provided
+          if (b.signature && b.message) {
+            const { ethers } = await import("ethers");
+            const recovered = ethers.verifyMessage(String(b.message), String(b.signature));
+            if (recovered.toLowerCase() !== walletAddress.toLowerCase())
+              return json(res, 400, { ok: false, error: "Signature verification failed" });
+          }
+          await updateUser(getRedis(), payload.userId, { walletAddress });
+          return json(res, 200, { ok: true, walletAddress });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── GET /admin/users ────────────────────────────────────────────────────
+      if (u.pathname === "/admin/users" && req.method === "GET") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const users = await listAllUsers(getRedis());
+        const safe = users.map(({ passwordHash: _, emailVerifyToken: __, ...u }) => u);
+        return json(res, 200, { ok: true, users: safe });
+      }
+
+      // ── POST /admin/users/:id/approve ───────────────────────────────────────
+      if (/^\/admin\/users\/[^/]+\/approve$/.test(u.pathname) && req.method === "POST") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        try {
+          const b = await readJson(req);
+          const vaultAddress = String(b.vaultAddress ?? "").trim();
+          if (!vaultAddress) return json(res, 400, { ok: false, error: "vaultAddress required" });
+          const user = await updateUser(getRedis(), userId, {
+            status: "active",
+            vaultAddress,
+            approvedAt: new Date().toISOString(),
+          });
+          if (!user) return json(res, 404, { ok: false, error: "user not found" });
+          await sendApprovalEmail(user.email, vaultAddress);
+          await auditLog(auth.userId, "approve", userId, `vault:${vaultAddress}`);
+          log.info({ adminId: auth.userId, userId, vaultAddress }, "[admin] user approved");
+          return json(res, 200, { ok: true, message: "User approved" });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── POST /admin/users/:id/reject ────────────────────────────────────────
+      if (/^\/admin\/users\/[^/]+\/reject$/.test(u.pathname) && req.method === "POST") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        const user = await getUserById(getRedis(), userId);
+        if (!user) return json(res, 404, { ok: false, error: "user not found" });
+        await sendRejectionEmail(user.email);
+        await auditLog(auth.userId, "reject", userId);
+        log.info({ adminId: auth.userId, userId }, "[admin] user rejected");
+        return json(res, 200, { ok: true, message: "User rejected — email sent" });
+      }
+
+      // ── GET /admin/users/:id/fees — per-user fee stats (admin) ───────────────
+      if (/^\/admin\/users\/[^/]+\/fees$/.test(u.pathname) && req.method === "GET") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        const user = await getUserById(getRedis(), userId);
+        if (!user) return json(res, 404, { ok: false, error: "User not found" });
+        const stats = await getUserFeeStats(getRedis(), userId, user.trialExpiresAt);
+        return json(res, 200, { ok: true, userId, ...stats });
+      }
+
+      // ── POST /admin/users/:id/suspend ───────────────────────────────────────
+      if (/^\/admin\/users\/[^/]+\/suspend$/.test(u.pathname) && req.method === "POST") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        const user = await updateUser(getRedis(), userId, { status: "suspended" });
+        if (!user) return json(res, 404, { ok: false, error: "user not found" });
+        // Revoke all active sessions for this user (scan session: keys — limited scan)
+        try {
+          const keys = await getRedis().keys("session:*");
+          const pipeline = getRedis().pipeline();
+          for (const k of keys) {
+            const v = await getRedis().get(k);
+            if (v === userId) pipeline.del(k);
+          }
+          await pipeline.exec();
+        } catch { /* non-fatal */ }
+        await auditLog(auth.userId, "suspend", userId);
+        log.info({ adminId: auth.userId, userId }, "[admin] user suspended");
+        return json(res, 200, { ok: true, message: "User suspended — session revoked" });
+      }
+
+      // ── DELETE /admin/users/:id ─────────────────────────────────────────────
+      if (/^\/admin\/users\/[^/]+$/.test(u.pathname) && req.method === "DELETE") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        const deleted = await deleteUser(getRedis(), userId);
+        if (!deleted) return json(res, 404, { ok: false, error: "user not found" });
+        await auditLog(auth.userId, "delete", userId);
+        log.info({ adminId: auth.userId, userId }, "[admin] user deleted");
+        return json(res, 200, { ok: true, message: "User deleted" });
+      }
+
+      // ── GET /admin/stats ────────────────────────────────────────────────────
+      if (u.pathname === "/admin/stats" && req.method === "GET") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const users = await listAllUsers(getRedis());
+        return json(res, 200, {
+          ok: true,
+          totalUsers:      users.length,
+          active:          users.filter(u => u.status === "active").length,
+          pendingApproval: users.filter(u => u.status === "pending_approval").length,
+          pendingEmail:    users.filter(u => u.status === "pending_email").length,
+          suspended:       users.filter(u => u.status === "suspended").length,
+          uptime:          Math.floor(process.uptime()),
+          botRunning:      getState().running,
+        });
+      }
+
+      // ── GET /admin/audit ────────────────────────────────────────────────────
+      if (u.pathname === "/admin/audit" && req.method === "GET") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const limit = Math.min(Number(u.searchParams.get("limit") ?? "100"), 1000);
+        const raw = await getRedis().lrange("audit:log", 0, limit - 1);
+        const entries = raw.map(r => { try { return JSON.parse(r); } catch { return r; } });
+        return json(res, 200, { ok: true, count: entries.length, entries });
+      }
+
+      // ── GET /admin/support-tickets ──────────────────────────────────────────
+      if (u.pathname === "/admin/support-tickets" && req.method === "GET") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const limit = Math.min(Number(u.searchParams.get("limit") ?? "50"), 200);
+        const raw = await getRedis().lrange("support:tickets", 0, limit - 1);
+        const tickets = raw.map(r => { try { return JSON.parse(r); } catch { return r; } });
+        return json(res, 200, { ok: true, count: tickets.length, tickets });
+      }
+
+      if (u.pathname === "/bot/config") {
+        if (req.method === "GET" || req.method === "HEAD") {
+          return json(res, 200, {
+            userAddress: currentUserAddress,
+            symbols: currentSymbols,
+            strategy: currentStrategy,
+            trigger: currentTrigger,
+          });
+        }
+      }
+
+      if (u.pathname === "/bot/state") {
+        return json(res, 200, {
+          ok: true,
+          config: {
+            userAddress: currentUserAddress,
+            symbols: currentSymbols,
+            strategy: currentStrategy,
+            trigger: currentTrigger,
+          },
+          state: getState(),
+        });
+      }
+
+      // View vault balances (read-only)
+      if (u.pathname === "/vault/balances") {
+        const user = u.searchParams.get("user") ?? currentUserAddress;
+        if (!user) return json(res, 400, { ok: false, error: "missing user" });
+        const r = await getVaultBalances(user);
+        return json(res, 200, { ok: true, user, balances: r });
+      }
+
+      // Debug: see all open positions for a user
+      if (u.pathname === "/vault/position") {
+        const user = u.searchParams.get("user") ?? currentUserAddress;
+        if (!user) return json(res, 400, { ok: false, error: "missing user" });
+        const c = getVaultReadContract();
+        const markets: string[] = await c.getOpenMarkets(user);
+        const positions: Record<string, any> = {};
+        for (const mId of markets) {
+          const p = await c.positionOf(user, mId);
+          positions[mId] = {
+            isOpen: p.isOpen,
+            isLong: p.isLong,
+            sizeX18: p.sizeX18.toString(),
+            entryPriceX18: p.entryPriceX18.toString(),
+            collateralX18: p.collateralX18.toString(),
+            openedAt: p.openedAt.toString(),
+          };
+        }
+        return json(res, 200, { ok: true, user, openCount: markets.length, positions });
+      }
+
+      if (u.pathname === "/bot/set" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const b = await readJson(req);
+          if (typeof b.userAddress === "string") currentUserAddress = b.userAddress;
+          if (typeof b.userKey === "string") currentUserAddress = b.userKey;
+          if (b.symbols != null) {
+            const next = normalizeSymbols(b.symbols);
+            if (!next.length) return json(res, 400, { ok: false, error: "no valid symbols after normalization" });
+            currentSymbols = next;
+            // Update WebSocket stream to new symbol set
+            updateStreamSymbols(currentSymbols);
+          }
+          if (b.trigger && typeof b.trigger === "object") {
+            const t: any = b.trigger;
+            if (typeof t.stochOS === "number") currentTrigger.stochOS = t.stochOS;
+            if (typeof t.stochOB === "number") currentTrigger.stochOB = t.stochOB;
+            if (typeof t.stochMid === "number") currentTrigger.stochMid = t.stochMid;
+            if (typeof t.stochDLen === "number") currentTrigger.stochDLen = t.stochDLen;
+          }
+          return json(res, 200, {
+            ok: true,
+            config: { userAddress: currentUserAddress, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
+          });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── /bot/config — save leverage / sizing to user Redis config ───────────
+      if (u.pathname === "/bot/config" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const b = await readJson(req);
+          const redis = getRedis();
+          // Load existing user config, merge, validate, save
+          const existing = await (async () => {
+            try { const s = await redis.get(CFG_KEYS.user(currentUserAddress)); return s ? JSON.parse(s) : {}; }
+            catch { return {}; }
+          })();
+          const merged = { ...existing, ...b };
+          const validated = validateConfig(merged);
+          // Per-symbol cap enforcement: cap DEFAULT_LEVERAGE against each active symbol
+          for (const sym of currentSymbols) {
+            const cap = symbolMaxLev(sym);
+            if (validated.DEFAULT_LEVERAGE > cap) validated.DEFAULT_LEVERAGE = cap;
+            if (validated.MAX_LEVERAGE > cap) validated.MAX_LEVERAGE = cap;
+          }
+          await redis.set(CFG_KEYS.user(currentUserAddress), JSON.stringify(validated));
+          log.info({ leverage: validated.DEFAULT_LEVERAGE, manualSizePct: validated.MANUAL_SIZE_PCT }, "[config] user bot config saved");
+          return json(res, 200, { ok: true, config: validated });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      if (u.pathname === "/bot/start") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        if (!currentUserAddress) return json(res, 400, { ok: false, error: "Set TEST_USER_ADDRESS env or POST /bot/set" });
+        currentSymbols = normalizeSymbols(currentSymbols);
+        if (!currentSymbols.length) return json(res, 400, { ok: false, error: "no valid symbols configured" });
+        const r = await startBot({ userKey: currentUserAddress, symbols: currentSymbols, trigger: currentTrigger });
+        setRunning(true);
+        await persistEngineState(true);   // survive backend restart
+        return json(res, 200, r);
+      }
+
+      if (u.pathname === "/bot/stop") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        const r = stopBot();
+        setRunning(false);
+        await persistEngineState(false);  // clear autostart flag
+        return json(res, 200, r);
+      }
+
+      // ── POST /pool/start — start bot for a specific user (admin) ─────────
+      if (u.pathname === "/pool/start" && req.method === "POST") {
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        try {
+          const b         = await readJson(req);
+          const userKey   = String(b.userKey   ?? "").trim();
+          const userId    = String(b.userId    ?? "").trim();
+          const rawSyms   = b.symbols ?? currentSymbols;
+          const symbols   = normalizeSymbols(rawSyms);
+          const trigger   = b.trigger ?? currentTrigger;
+
+          if (!userKey) return json(res, 400, { ok: false, error: "userKey required" });
+          if (!symbols.length) return json(res, 400, { ok: false, error: "at least one symbol required" });
+
+          const r = await workerPool.startUser({
+            userKey,
+            symbols,
+            trigger,
+            userId:        userId  || undefined,
+            skipSubCheck:  !userId,   // skip if no userId provided (admin override)
+          });
+          await auditLog(adminResult.userId, "pool:start", userKey, `symbols=${symbols.join(",")}`);
+          return json(res, r.ok ? 200 : 400, r);
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /pool/stop — stop bot for a specific user (admin) ───────────
+      if (u.pathname === "/pool/stop" && req.method === "POST") {
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        try {
+          const b       = await readJson(req);
+          const userKey = String(b.userKey ?? "").trim();
+          if (!userKey) return json(res, 400, { ok: false, error: "userKey required" });
+
+          const r = workerPool.stopUser(userKey);
+          await auditLog(adminResult.userId, "pool:stop", userKey);
+          return json(res, 200, r);
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /pool/stopall — stop all user workers (admin emergency) ──────
+      if (u.pathname === "/pool/stopall" && req.method === "POST") {
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        const r = workerPool.stopAll();
+        await auditLog(adminResult.userId, "pool:stopall", "*", `stopped=${r.stopped}`);
+        return json(res, 200, r);
+      }
+
+      // ── GET /pool/status — list all active workers (admin) ────────────────
+      if (u.pathname === "/pool/status") {
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        return json(res, 200, {
+          ok:           true,
+          workerCount:  workerPool.size,
+          workers:      workerPool.getStatus(),
+          candleCache:  getCandleCacheStats(),
+        });
+      }
+
+      // ── GET /pool/status/:userKey — single-user worker status (admin) ─────
+      if (u.pathname.startsWith("/pool/status/")) {
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        const userKey = decodeURIComponent(u.pathname.slice("/pool/status/".length)).trim();
+        if (!userKey) return json(res, 400, { ok: false, error: "userKey required in path" });
+        const status  = workerPool.getUserStatus(userKey);
+        if (!status)  return json(res, 404, { ok: false, error: "No worker found for this userKey" });
+        return json(res, 200, { ok: true, ...status });
+      }
+
+      // ── Close all open on-chain positions (admin) ─────────────────────────
+      if (u.pathname === "/bot/closeall" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const user = currentUserAddress;
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
+          const readC  = getVaultReadContract();
+          const markets: string[] = await readC.getOpenMarkets(user);
+          if (!markets.length) return json(res, 200, { ok: true, closed: 0, results: [] });
+
+          const signer   = getSigner();
+          const writeC   = getVaultWriteContract();
+          const results: any[] = [];
+
+          for (const marketId of markets) {
+            try {
+              // Use current mid-price from WS cache as exit price
+              const MARKET_SYMBOLS: Record<string, string> = {
+                "0xcd423b16b64109a0492eab881d06ef1d6470d25f8e3d6f04f5acc111f176939c": "BTCUSDT",
+                "0xaeb17180ec6df0d643751cbbe82ac67166a910f4092c23f781cd39e46582ec9c": "ETHUSDT",
+                "0xae9c0146ab64b81aae7608dc5ffddfa320640d5dece2ab37ecf0809dcc5f0c2a": "TAOUSDT",
+                "0x23c6a2c43f92acac35ed89f352fa5f2e30496347aeb1aafb8e0a14766b47dbf1": "RENDERUSDT",
+                "0x3db5e9fb22b6f66ce6550ab2b9d3872f875f575780c6abb9c95f9ce03845a83e": "SOLUSDT",
+                "0xaeee40e849f19d8b8252d9e750ed2ff6fa233c95aa4a1d3da9858a3b18ade5df": "BNBUSDT",
+              };
+              const symbol    = MARKET_SYMBOLS[marketId] ?? null;
+              // Try WS cache first; fall back to Binance Futures REST
+              let priceNum: number | null = symbol ? getLatestPrice(symbol) : null;
+              if (!priceNum && symbol) {
+                try {
+                  const pr = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { signal: AbortSignal.timeout(4000) });
+                  const pj = await pr.json() as { price: string };
+                  priceNum = parseFloat(pj.price);
+                } catch { /* leave null */ }
+              }
+              if (!priceNum) {
+                results.push({ marketId, symbol, ok: false, error: "no live price — retry shortly" });
+                continue;
+              }
+              const exitPriceX18 = BigInt(Math.round(priceNum * 1e18));
+              const r = await closePositionVaultV2(writeC, signer, { user, marketId, exitPriceX18 });
+              log.info({ marketId, symbol, txHash: r.txHash }, "[closeall] position closed");
+              results.push({ marketId, symbol, ok: true, txHash: r.txHash });
+            } catch (e: any) {
+              results.push({ marketId, ok: false, error: e?.reason ?? e?.message ?? String(e) });
+            }
+          }
+
+          const closed = results.filter(r => r.ok).length;
+          return json(res, 200, { ok: true, closed, total: markets.length, results });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── Close a single position by symbol ────────────────────────────────
+      if (u.pathname === "/vault/close-position" && req.method === "POST") {
+        try {
+          const b: any = await readJson(req);
+          const symbol: string | undefined = b?.symbol?.toUpperCase();
+          if (!symbol) return json(res, 400, { ok: false, error: "symbol required" });
+
+          const user = currentUserAddress;
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
+
+          const { symbolToMarketId } = await import("./services/onchain/vaultAdapter.js");
+          const marketId = symbolToMarketId(symbol);
+
+          // Get live price — WS cache first, then Binance REST fallback
+          let priceNum: number | null = getLatestPrice(symbol);
+          if (!priceNum) {
+            try {
+              const pr = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, { signal: AbortSignal.timeout(4000) });
+              const pj = await pr.json() as { price: string };
+              priceNum = parseFloat(pj.price);
+            } catch { /* leave null */ }
+          }
+          if (!priceNum) return json(res, 503, { ok: false, error: "no live price — retry shortly" });
+
+          const exitPriceX18 = BigInt(Math.round(priceNum * 1e18));
+          const signer = getSigner();
+          const writeC = getVaultWriteContract();
+          const r = await closePositionVaultV2(writeC, signer, { user, marketId, exitPriceX18 });
+          log.info({ symbol, marketId, txHash: r.txHash }, "[close-position] closed");
+          return json(res, 200, { ok: true, symbol, txHash: r.txHash, exitPrice: priceNum });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.reason ?? e?.message ?? String(e) });
+        }
+      }
+
+      // SSE: live event stream for dashboard
+      if (u.pathname === "/bot/events") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        addSseClient(res);
+        // Send recent history so client is immediately populated
+        const history = getEventHistory();
+        for (const e of history) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        // Keep alive ping every 15s
+        const ping = setInterval(() => {
+          try { res.write(`: ping\n\n`); } catch { clearInterval(ping); }
+        }, 15_000);
+        res.on("close", () => clearInterval(ping));
+        return;
+      }
+
+      // REST: last N events
+      if (u.pathname === "/bot/history") {
+        const limit = Math.min(Number(u.searchParams.get("limit") ?? "50"), 500);
+        const history = getEventHistory().slice(-limit);
+        return json(res, 200, { ok: true, count: history.length, events: history });
+      }
+
+      // ── Market price: WS cache first, REST fallback ──────────────────────────
+      if (u.pathname === "/market/price") {
+        const symbol = (u.searchParams.get("symbol") ?? "").toUpperCase();
+        if (!symbol) return json(res, 400, { ok: false, error: "missing symbol" });
+
+        // Try WS cache first (sub-second latency)
+        const cached = getLatestPrice(symbol);
+        if (cached !== null) {
+          return json(res, 200, { ok: true, symbol, price: String(cached), source: "ws" });
+        }
+
+        // Fallback to REST if WS cache is empty or stale
+        try {
+          const r = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, {
+            signal: AbortSignal.timeout(8000),
+          });
+          const data: any = await r.json();
+          return json(res, 200, { ok: true, symbol: data.symbol, price: data.price, source: "rest" });
+        } catch (e: any) {
+          return json(res, 502, { ok: false, error: e?.message ?? "price fetch failed" });
+        }
+      }
+
+      // ── Batch market prices: WS cache first, REST fallback ───────────────────
+      if (u.pathname === "/market/prices") {
+        const symbols = (u.searchParams.get("symbols") ?? "")
+          .split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+        if (!symbols.length) return json(res, 400, { ok: false, error: "missing symbols" });
+
+        const results: Record<string, string> = {};
+        const wsHits: string[] = [];
+        const restNeeded: string[] = [];
+
+        // Check WS cache for each symbol
+        for (const sym of symbols) {
+          const p = getLatestPrice(sym);
+          if (p !== null) { results[sym] = String(p); wsHits.push(sym); }
+          else restNeeded.push(sym);
+        }
+
+        // REST fallback for any symbols not in WS cache
+        if (restNeeded.length) {
+          try {
+            await Promise.all(restNeeded.map(async (sym) => {
+              const r = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${sym}`, {
+                signal: AbortSignal.timeout(8000),
+              });
+              const d: any = await r.json();
+              results[sym] = d.price;
+            }));
+          } catch (e: any) {
+            return json(res, 502, { ok: false, error: e?.message ?? "price fetch failed" });
+          }
+        }
+
+        return json(res, 200, { ok: true, prices: results, wsHits, restFallback: restNeeded });
+      }
+
+      // ── Performance / closed trade history ───────────────────────────────────
+      if (u.pathname === "/bot/performance") {
+        const { loadClosedTrades } = await import("./services/cache/tradeCache.js");
+        const { getRedis } = await import("./services/cache/redis.js");
+        const limit = Math.min(Number(u.searchParams.get("limit") ?? "200"), 2000);
+        const trades = await loadClosedTrades(getRedis(), currentUserAddress, limit);
+        // Also compute summary metrics over all closed trades
+        const { computeMetrics } = await import("./services/backtest/metrics.js");
+        const metrics = computeMetrics(
+          (trades as any[]).map(t => ({
+            symbol: t.symbol ?? "?",
+            isLong: t.isLong ?? false,
+            entryPrice: t.entryPrice ?? 0,
+            exitPrice: t.exitPrice ?? 0,
+            pnlPct: t.pnlPct ?? 0,
+            leverage: t.leverage ?? 5,
+            durationMs: t.durationMs ?? 0,
+            reason: t.reason ?? "?",
+            closedAt: t.closedAt ?? 0,
+          }))
+        );
+        return json(res, 200, { ok: true, count: trades.length, trades, metrics });
+      }
+
+      // ── Backtest: walk-forward strategy simulation ────────────────────────────
+      if (u.pathname === "/backtest/run") {
+        const symbol   = (u.searchParams.get("symbol") ?? "BTCUSDT").toUpperCase();
+        const days     = Math.min(Math.max(Number(u.searchParams.get("days") ?? "7"), 1), 30);
+        const leverage = Math.min(Math.max(Number(u.searchParams.get("leverage") ?? "5"), 1), 20);
+        const stochOS  = Number(u.searchParams.get("stochOS") ?? currentTrigger.stochOS);
+        const stochOB  = Number(u.searchParams.get("stochOB") ?? currentTrigger.stochOB);
+
+        // Redis cache key: avoid re-running the same backtest within 1h
+        const cacheKey = `backtest:${symbol}:${days}:${leverage}:${stochOS}:${stochOB}`;
+        try {
+          const cached = await getRedis().get(cacheKey);
+          if (cached) {
+            log.info({ cacheKey }, "[backtest] cache hit");
+            return json(res, 200, { ok: true, cached: true, ...JSON.parse(cached) });
+          }
+        } catch { /* ignore Redis errors */ }
+
+        try {
+          const { runBacktest } = await import("./services/backtest/backtestRunner.js");
+          const result = await runBacktest({ symbol, days, leverage, stochOS, stochOB });
+
+          // Cache result in Redis for 1 hour
+          try {
+            await getRedis().set(cacheKey, JSON.stringify(result), "EX", 3600);
+          } catch { /* ignore */ }
+
+          return json(res, 200, { ok: true, cached: false, ...result });
+        } catch (e: any) {
+          log.error({ err: e?.message }, "[backtest] run failed");
+          return json(res, 500, { ok: false, error: e?.message ?? "backtest failed" });
+        }
+      }
+
+      // ── Phase 3: Risk / Circuit Breaker status ────────────────────────────────
+      if (u.pathname === "/bot/risk") {
+        const { checkCircuitBreaker, getDailyReturn } = await import("./services/bot/drawdownGuard.js");
+        const maxLoss    = Math.abs(Number(process.env.MAX_DAILY_LOSS_PCT ?? "0.10"));
+        const cb         = await checkCircuitBreaker(getRedis(), currentUserAddress, maxLoss);
+        const dailyReturn = await getDailyReturn(getRedis(), currentUserAddress);
+        return json(res, 200, {
+          ok: true,
+          dailyReturn,
+          dailyReturnPct: +(dailyReturn * 100).toFixed(2),
+          circuitBreaker: {
+            triggered: cb.triggered,
+            limit:     cb.limit,
+            limitPct:  +(cb.limit * 100).toFixed(2),
+          },
+          maxDailyLossPct: maxLoss,
+          date: cb.date,
+        });
+      }
+
+      // ── Phase 3: Circuit breaker manual reset (JWT-protected) ───────────────
+      if (u.pathname === "/bot/risk/reset" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        const { resetCircuitBreaker } = await import("./services/bot/drawdownGuard.js");
+        await resetCircuitBreaker(getRedis(), currentUserAddress);
+        return json(res, 200, { ok: true, message: "Circuit breaker reset for today" });
+      }
+
+      // ── Phase 3: AI model stats ───────────────────────────────────────────────
+      if (u.pathname === "/ai/model") {
+        const { getModelStats } = await import("./services/ai/signalScorer.js");
+        const stats = await getModelStats(getRedis());
+        return json(res, 200, { ok: true, ...stats });
+      }
+
+      // ── GET /vault/wallet-balance — wallet USDC + vault + fees + pending ──────
+      if (u.pathname === "/vault/wallet-balance") {
+        try {
+          const user = u.searchParams.get("user") ?? currentUserAddress;
+          if (!user) return json(res, 400, { ok: false, error: "missing user" });
+          const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
+          const readC = getVaultReadContract();
+
+          // Fetch everything in parallel
+          const [
+            stableAddr,
+            stableX18,
+            pendingX18,
+            minDeposit,
+            depositFeeBps,
+            withdrawFeeBps,
+            emergencyFeeBps,
+          ] = await Promise.all([
+            readC.stable() as Promise<string>,
+            readC.stableBalanceX18(user) as Promise<bigint>,
+            readC.pendingStableWithdrawalX18(user) as Promise<bigint>,
+            readC.minStableDeposit() as Promise<bigint>,
+            readC.depositFeeBps() as Promise<bigint>,
+            readC.withdrawFeeBps() as Promise<bigint>,
+            readC.emergencyFeeBps() as Promise<bigint>,
+          ]);
+
+          // Wallet balance (raw USDC in wallet, not yet deposited)
+          const wallet = await getWalletStableBalance(getProvider(), stableAddr, user, STABLE_DECIMALS);
+
+          const BPS_DENOM = 10_000n;
+          const fmtX18 = (x: bigint) => +(Number(x) / 1e18).toFixed(2);
+          const fmtRaw = (x: bigint) => +(Number(x) / 10 ** STABLE_DECIMALS).toFixed(2);
+          const fmtBps = (b: bigint) => +(Number(b) / 100).toFixed(2); // e.g. 1000 → 10.00%
+
+          return json(res, 200, {
+            ok: true,
+            user,
+            stableToken: stableAddr,
+            wallet:    { raw: wallet.raw, formatted: wallet.formatted, decimals: STABLE_DECIMALS },
+            vault:     { wad: stableX18.toString(), formatted: fmtX18(stableX18) },
+            pending:   { wad: pendingX18.toString(), formatted: fmtX18(pendingX18) },
+            minDeposit:{ raw: minDeposit.toString(), formatted: fmtRaw(minDeposit) },
+            fees: {
+              depositPct:   fmtBps(depositFeeBps),
+              withdrawPct:  fmtBps(withdrawFeeBps),
+              emergencyPct: fmtBps(emergencyFeeBps),
+              depositNet:   +(Number(BPS_DENOM - depositFeeBps) / 100).toFixed(2),
+              withdrawNet:  +(Number(BPS_DENOM - withdrawFeeBps) / 100).toFixed(2),
+              emergencyNet: +(Number(BPS_DENOM - emergencyFeeBps) / 100).toFixed(2),
+            },
+          });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /vault/deposit — ERC20 approve + depositStable ──────────────────
+      if (u.pathname === "/vault/deposit" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const payload    = decodeToken(req);
+          const userId     = payload?.userId ?? "legacy";
+          const b = await readJson(req);
+          const amountUsdc = parseFloat(b.amount);
+          if (!amountUsdc || amountUsdc <= 0) return json(res, 400, { ok: false, error: "invalid amount" });
+          const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
+          const amountRaw  = BigInt(Math.round(amountUsdc * 10 ** STABLE_DECIMALS));
+          const readC      = getVaultReadContract();
+          const stableAddr: string = await readC.stable();
+          const minDeposit: bigint = await readC.minStableDeposit();
+          if (amountRaw < minDeposit) {
+            return json(res, 400, { ok: false, error: `Amount below minimum deposit of ${Number(minDeposit) / 10 ** STABLE_DECIMALS} USDC` });
+          }
+          const signer    = getSigner();
+          const writeC    = getVaultWriteContract();
+          const vaultAddr = getVaultAddress();
+          log.info({ amount: amountUsdc, amountRaw: amountRaw.toString(), stableAddr }, "[vault] deposit initiated");
+          const r = await depositStableToVault(writeC, signer, stableAddr, vaultAddr, amountRaw);
+          log.info({ txHash: r.txHash, amount: amountUsdc }, "[vault] deposit confirmed");
+          // Record platform fee
+          const { fee: platformFee, net: netAfterFee } = await recordDeposit(getRedis(), userId, amountUsdc, r.txHash);
+          const depositFeeBps: bigint = await readC.depositFeeBps();
+          const netPct = +(Number(10_000n - depositFeeBps) / 100).toFixed(2);
+          return json(res, 200, {
+            ok: true,
+            txHash: r.txHash,
+            amount: amountUsdc,
+            amountRaw: amountRaw.toString(),
+            contractFee: `${100 - netPct}%`,
+            platformFee: `${FEE.DEPOSIT_BPS / 100}%`,
+            platformFeeUsdc: platformFee,
+            netCredited: +(amountUsdc * netPct / 100).toFixed(2),
+            netAfterAllFees: netAfterFee,
+          });
+        } catch (e: any) {
+          log.error({ err: e?.message }, "[vault] deposit failed");
+          return json(res, 500, { ok: false, error: e?.reason ?? e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /vault/withdraw — normal 2-step (initiate+approve) or emergency ─
+      if (u.pathname === "/vault/withdraw" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const payload  = decodeToken(req);
+          const userId   = payload?.userId ?? "legacy";
+          const b = await readJson(req);
+          const mode: "normal" | "emergency" = b.emergency === true ? "emergency" : "normal";
+          const signer   = getSigner();
+          const writeC   = getVaultWriteContract();
+          const readC    = getVaultReadContract();
+          const user     = currentUserAddress;
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
+
+          // Resolve amount: number or "all"
+          let amountRaw: bigint;
+          const stableX18: bigint = await readC.stableBalanceX18(user);
+          const vaultBalanceUsdc = +(Number(stableX18) / 1e18).toFixed(6);
+
+          if (b.amount === "all" || b.all === true) {
+            // Convert x18 → raw (6 decimals): divide by 1e12
+            amountRaw = stableX18 / 1_000_000_000_000n;
+            if (amountRaw === 0n) return json(res, 400, { ok: false, error: "vault balance is zero" });
+          } else {
+            const amountUsdc = parseFloat(b.amount);
+            if (!amountUsdc || amountUsdc <= 0) return json(res, 400, { ok: false, error: 'invalid amount — send a number or "all"' });
+            const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
+            amountRaw = BigInt(Math.round(amountUsdc * 10 ** STABLE_DECIMALS));
+          }
+
+          const amountUsdc = Number(amountRaw) / 1_000_000;
+
+          if (mode === "emergency") {
+            // Emergency: single call, bypasses approval — higher fee (15%)
+            log.info({ amount: amountUsdc, amountRaw: amountRaw.toString() }, "[vault] emergency withdraw initiated");
+            const r = await emergencyWithdrawFromVault(writeC, signer, amountRaw);
+            const feeBps: bigint = await readC.emergencyFeeBps();
+            const contractNetReceived = +(amountUsdc * Number(10_000n - feeBps) / 10_000).toFixed(2);
+            // Record platform fees (withdraw fee + profit share)
+            const fees = await recordWithdrawal(getRedis(), userId, amountUsdc, vaultBalanceUsdc, "emergency", r.txHash);
+            log.info({ txHash: r.txHash, contractNetReceived, platformFees: fees }, "[vault] emergency withdraw confirmed");
+            return json(res, 200, {
+              ok: true, txHash: r.txHash, type: "emergency",
+              amount: amountUsdc,
+              contractFee: `${Number(feeBps)/100}%`,
+              contractNetReceived,
+              platformWithdrawFee: fees.withdrawFee,
+              profitShare: fees.profitShare,
+              totalPlatformFee: fees.totalFee,
+              netReceived: fees.net,
+            });
+          } else {
+            // Normal: initiate (user) → approve (bot as WITHDRAW_APPROVER_ROLE)
+            log.info({ amount: amountUsdc, amountRaw: amountRaw.toString() }, "[vault] normal withdraw initiated");
+            const r = await withdrawStableFromVault(writeC, signer, user, amountRaw);
+            const feeBps: bigint = await readC.withdrawFeeBps();
+            const contractNetReceived = +(amountUsdc * Number(10_000n - feeBps) / 10_000).toFixed(2);
+            // Record platform fees (withdraw fee + profit share)
+            const fees = await recordWithdrawal(getRedis(), userId, amountUsdc, vaultBalanceUsdc, "normal", r.txHash);
+            log.info({ initTxHash: r.initTxHash, txHash: r.txHash, contractNetReceived, platformFees: fees }, "[vault] normal withdraw confirmed");
+            return json(res, 200, {
+              ok: true, initTxHash: r.initTxHash, txHash: r.txHash, type: "normal",
+              amount: amountUsdc,
+              contractFee: `${Number(feeBps)/100}%`,
+              contractNetReceived,
+              platformWithdrawFee: fees.withdrawFee,
+              profitShare: fees.profitShare,
+              totalPlatformFee: fees.totalFee,
+              netReceived: fees.net,
+            });
+          }
+        } catch (e: any) {
+          log.error({ err: e?.message }, "[vault] withdraw failed");
+          return json(res, 500, { ok: false, error: e?.reason ?? e?.message ?? String(e) });
+        }
+      }
+
+      // ── GET /fees/stats — per-user fee accounting + subscription status ──────
+      if (u.pathname === "/fees/stats") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload = decodeToken(req);
+          const userId  = payload?.userId ?? "legacy";
+          const user    = userId !== "legacy" ? await getUserById(getRedis(), userId) : null;
+          const stats   = await getUserFeeStats(getRedis(), userId, user?.trialExpiresAt ?? null);
+          return json(res, 200, { ok: true, ...stats });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /subscription/pay — record subscription payment (20 USDC/month) ─
+      if (u.pathname === "/subscription/pay" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload = decodeToken(req);
+          const userId  = payload?.userId ?? "legacy";
+          const b       = await readJson(req);
+          const amount  = parseFloat(b.amount ?? FEE.SUBSCRIPTION_USDC);
+          if (amount < FEE.SUBSCRIPTION_USDC) {
+            return json(res, 400, { ok: false, error: `Minimum subscription payment is ${FEE.SUBSCRIPTION_USDC} USDC` });
+          }
+          const { paidUntil } = await recordSubscriptionPayment(getRedis(), userId, amount);
+          log.info({ userId, amount, paidUntil }, "[subscription] payment recorded");
+          return json(res, 200, { ok: true, paidUntil, amount, message: `Subscription active until ${paidUntil}` });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── GET /subscription/status — quick subscription check ──────────────────
+      if (u.pathname === "/subscription/status") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload = decodeToken(req);
+          const userId  = payload?.userId ?? "legacy";
+          const user    = userId !== "legacy" ? await getUserById(getRedis(), userId) : null;
+          const status  = await checkSubscription(getRedis(), userId, user?.trialExpiresAt ?? null);
+          return json(res, 200, { ok: true, userId, ...status, subscriptionUSDC: FEE.SUBSCRIPTION_USDC });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── GET /support/status — live system health for support widget ──────────
+      if (u.pathname === "/support/status") {
+        const botState = getState();
+        // Check Redis connectivity
+        let redisOk = false;
+        try { await getRedis().ping(); redisOk = true; } catch { /* */ }
+        // Check on-chain connectivity
+        let chainOk = false;
+        let blockNumber = 0;
+        try {
+          const provider = getProvider();
+          blockNumber = Number(await provider.getBlockNumber());
+          chainOk = blockNumber > 0;
+        } catch { /* */ }
+        // Open positions count
+        let openPositions = 0;
+        try {
+          const c = getVaultReadContract();
+          const markets: string[] = await (c as any).getOpenMarkets(currentUserAddress);
+          openPositions = Array.isArray(markets) ? markets.length : 0;
+        } catch { /* */ }
+        return json(res, 200, {
+          ok: true,
+          services: {
+            bot:   { status: botState.running ? "operational" : "stopped", running: botState.running },
+            redis: { status: redisOk ? "operational" : "degraded" },
+            chain: { status: chainOk ? "operational" : "degraded", blockNumber },
+          },
+          openPositions,
+          timestamp: Date.now(),
+        });
+      }
+
+      // ── POST /support/ticket — submit a support request ───────────────────────
+      if (u.pathname === "/support/ticket" && req.method === "POST") {
+        try {
+          const b = await readJson(req);
+          if (!b.message || String(b.message).trim().length < 5)
+            return json(res, 400, { ok: false, error: "message too short" });
+          const ticket = {
+            id: `TKT-${Date.now()}`,
+            name:     String(b.name     ?? "Anonymous").slice(0, 80),
+            email:    String(b.email    ?? "").slice(0, 120),
+            category: String(b.category ?? "general").slice(0, 40),
+            message:  String(b.message).slice(0, 2000),
+            createdAt: Date.now(),
+          };
+          await getRedis().lpush("support:tickets", JSON.stringify(ticket));
+          await getRedis().ltrim("support:tickets", 0, 999); // keep latest 1000
+          log.info({ ticketId: ticket.id, category: ticket.category }, "[support] ticket submitted");
+          return json(res, 200, { ok: true, ticketId: ticket.id, message: "Support request received. We'll respond within 24 hours." });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      return json(res, 404, { ok: false, error: "not found" });
+    } catch (e: any) {
+      recordError(e?.message ?? String(e));
+      log.error({ err: e?.message, stack: e?.stack }, "[server] unhandled error");
+      return json(res, 500, { ok: false, error: e?.message ?? "internal error" });
+    }
+  })
+  .listen(PORT, async () => {
+    try {
+      // ── Startup sequence ─────────────────────────────────────────────────────
+      // 1. Connect Redis
+      await connectRedis();
+
+      // 2. Restore event history from Redis into in-memory ring buffer
+      await restoreEventHistory();
+
+      // 3. Start Binance WebSocket price stream for configured symbols
+      startPriceStream(currentSymbols);
+
+      // 4. Verify on-chain connection
+      await assertOnchainReady();
+
+      // 5. Auto-restart engine if it was running before crash/restart
+      try {
+        const redis = getRedis();
+        const saved = await redis.get(REDIS_ENGINE_KEY);
+        if (saved) {
+          const s = JSON.parse(saved);
+          if (s.running && s.userKey) {
+            // Restore symbols/trigger from saved state (user may not be at dashboard)
+            if (Array.isArray(s.symbols) && s.symbols.length) currentSymbols = s.symbols;
+            if (s.trigger) currentTrigger = s.trigger;
+            // Sync price stream to the restored symbol list — the stream was started
+            // at step 3 with the process.env.SYMBOLS default, which may differ from
+            // what was saved in Redis (e.g. after a symbol swap via dashboard/Redis).
+            updateStreamSymbols(currentSymbols);
+            log.info({ symbols: currentSymbols }, "[server] auto-resuming engine after restart");
+            await startBot({ userKey: s.userKey, symbols: currentSymbols, trigger: currentTrigger });
+            setRunning(true);
+          }
+        }
+      } catch (e: any) {
+        log.warn({ err: e?.message }, "[server] auto-restart check failed (non-fatal)");
+      }
+
+      log.info({ port: PORT, symbols: currentSymbols }, "[server] ready ✓");
+    } catch (e: any) {
+      log.error({ err: e?.message }, "[server] startup error");
+    }
+  });
+
+// ── Global safety net ─────────────────────────────────────────────────────────
+process.on("uncaughtException", (err: any) => {
+  const code = err?.code ?? "";
+  const msg  = err?.message ?? String(err);
+  // Standard POSIX network error codes
+  const networkCodes = ["EADDRNOTAVAIL", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND"];
+  // ethers.js v6 messages for transient RPC connectivity issues (e.g. dead backend node)
+  const networkMsgs  = ["could not coalesce", "connection refused", "missing response", "bad response", "timeout"];
+  const isNetwork = networkCodes.includes(code) || networkMsgs.some(p => msg.toLowerCase().includes(p));
+  if (isNetwork) {
+    log.warn({ code, err: msg }, "[process] network error suppressed");
+    recordError(`network: ${code || "RPC"} — ${msg}`);
+  } else {
+    log.error({ err: msg, stack: err?.stack }, "[process] uncaughtException");
+    recordError(msg);
+  }
+});
+
+process.on("unhandledRejection", (reason: any) => {
+  const msg = reason?.message ?? String(reason);
+  log.warn({ err: msg }, "[process] unhandledRejection suppressed");
+  recordError(msg);
+});
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+process.on("SIGTERM", async () => {
+  log.info("[process] SIGTERM received — shutting down");
+  stopPriceStream();
+  stopEngine();
+  await disconnectRedis();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  log.info("[process] SIGINT received — shutting down");
+  stopPriceStream();
+  stopEngine();
+  await disconnectRedis();
+  process.exit(0);
+});

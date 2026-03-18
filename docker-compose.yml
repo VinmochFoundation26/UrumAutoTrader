@@ -1,0 +1,82 @@
+version: "3.9"
+
+# ── AutoTrader Bot — Production Stack ────────────────────────────────────────
+# Usage:
+#   1. Copy backend/.env.example to backend/.env and fill in secrets
+#   2. docker compose up -d --build
+#   3. Visit http://your-server (or https after Certbot setup)
+#
+# Services:
+#   redis    — persistent trade state + config
+#   backend  — Node 20 API + trading engine (port 5050, internal only)
+#   frontend — Nginx serving React SPA + proxying /api → backend (port 80)
+#   nginx    — SSL termination + reverse proxy (port 443, requires Certbot)
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Mount .env directly so dotenv reads it — avoids Docker interpolating $vars in bcrypt hashes
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PORT=5050
+    volumes:
+      - ./backend/.env:/app/.env:ro
+      - ./bot.config.json:/bot.config.json
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5050/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    # NOT exposed to host — only frontend nginx proxies it
+    expose:
+      - "5050"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=/api
+        - VITE_USER_ADDRESS=0xbb75Bd3585DD162bd18b08501757B7371218af85
+    restart: unless-stopped
+    depends_on:
+      - backend
+    expose:
+      - "80"
+
+  # ── SSL reverse proxy ────────────────────────────────────────────────────────
+  nginx-ssl:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx-ssl.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+    ports:
+      - "443:443"
+      - "80:80"
+    depends_on:
+      - frontend
+
+volumes:
+  redis_data:
+    driver: local

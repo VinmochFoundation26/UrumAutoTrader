@@ -1,0 +1,327 @@
+import { Contract, keccak256, toUtf8Bytes } from "ethers";
+import type { JsonRpcProvider, Signer, TransactionResponse, Wallet } from "ethers";
+import type { Redis } from "ioredis";
+import { ERC20_ABI, getFallbackProvider, getProvider } from "./contractInstance.js";
+import { getNonce, syncNonceFromChain } from "./nonceManager.js";
+import { getEip1559Params } from "./gasOracle.js";
+import { recordPendingTx, clearPendingTx } from "./txTracker.js";
+import { log } from "../../logger.js";
+
+/**
+ * waitWithFallback — awaits a transaction receipt using the primary provider.
+ * If the primary provider throws a connectivity error (e.g. "connection refused",
+ * "could not coalesce", "ECONNREFUSED"), automatically retries receipt polling
+ * on the fallback provider using the known tx hash.
+ *
+ * This prevents the common failure mode where arb1.arbitrum.io routes a receipt
+ * poll to a dead internal node (e.g. 10.25.x.x:8547) after a tx was already broadcast.
+ */
+const FALLBACK_ERROR_PATTERNS = [
+  "connection refused",
+  "could not coalesce",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "network error",
+  "timeout",
+  "missing response",
+  "bad response",
+];
+
+function isNetworkError(err: any): boolean {
+  const msg = String(err?.message ?? err ?? "").toLowerCase();
+  return FALLBACK_ERROR_PATTERNS.some(p => msg.includes(p.toLowerCase()));
+}
+
+async function waitWithFallback(tx: TransactionResponse, retries = 3): Promise<any> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      // First attempt: use primary provider via tx.wait()
+      if (attempt === 1) return await tx.wait();
+
+      // Subsequent attempts: poll fallback provider directly by tx hash
+      const fallback = getFallbackProvider();
+      if (!fallback) {
+        log.warn({ txHash: tx.hash }, "[vaultAdapter] no fallback provider — retrying primary");
+        return await tx.wait();
+      }
+      log.warn({ txHash: tx.hash, attempt }, "[vaultAdapter] retrying receipt on fallback provider");
+      // Poll until mined (up to 90s, checking every 3s)
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        const receipt = await fallback.getTransactionReceipt(tx.hash);
+        if (receipt) {
+          // Guard: status=0 means on-chain revert — throw so caller treats it as failure
+          // Without this check, a reverted tx would silently register as a successful trade
+          if (receipt.status === 0) {
+            throw new Error(`tx ${tx.hash} reverted on-chain (status=0)`);
+          }
+          return receipt;
+        }
+        await new Promise(r => setTimeout(r, 3_000));
+      }
+      throw new Error(`tx ${tx.hash} not mined within 90s on fallback provider`);
+    } catch (err: any) {
+      if (attempt === retries) throw err;        // exhausted all retries
+      if (!isNetworkError(err)) throw err;       // non-network error — propagate immediately
+      log.warn({ txHash: tx.hash, attempt, err: err?.message },
+        "[vaultAdapter] RPC connectivity error — retrying with fallback");
+      await new Promise(r => setTimeout(r, 1_000 * attempt)); // brief backoff
+    }
+  }
+}
+import type { Wad } from "./wad.js";
+
+// ── Revert reason classifier ──────────────────────────────────────────────────
+//
+// Maps known error message patterns to one of three actions the caller should take:
+//   "retry"    — transient issue (nonce, RPC hiccup) — re-attempt after resync
+//   "abort"    — permanent for this tick (contract logic) — skip this trade
+//   "cooldown" — vault cooldown active — wait and do not retry until it expires
+//
+// Pattern matching is case-insensitive and substring-based.
+
+const REVERT_MAP: Array<[string, RevertAction]> = [
+  // Vault-specific reverts
+  ["cooldown",                    "cooldown"],
+  ["position already open",       "abort"],
+  ["max open positions",          "abort"],
+  ["market not enabled",          "abort"],
+  ["market disabled",             "abort"],
+  ["paused",                      "abort"],
+  ["insufficient collateral",     "abort"],
+  ["insufficient balance",        "abort"],
+  ["not enough",                  "abort"],
+  ["no open position",            "abort"],
+  ["position not open",           "abort"],
+  // EVM / ethers nonce errors
+  ["nonce too low",               "retry"],
+  ["replacement transaction",     "retry"],
+  ["already known",               "retry"],
+  ["transaction underpriced",     "retry"],
+  // status=0 catch-all (shouldn't reach here — waitWithFallback throws on status=0)
+  ["status=0",                    "abort"],
+  ["reverted on-chain",           "abort"],
+];
+
+export type RevertAction = "retry" | "abort" | "cooldown";
+
+/**
+ * Classify an on-chain (or pre-flight) error into a RevertAction.
+ * Unknown errors default to "retry" (conservative — don't silently discard).
+ */
+export function classifyRevert(err: any): RevertAction {
+  const msg = String(err?.message ?? err ?? "").toLowerCase();
+  for (const [pattern, action] of REVERT_MAP) {
+    if (msg.includes(pattern.toLowerCase())) return action;
+  }
+  return "retry";
+}
+
+/** Convert a symbol string (e.g. "ETHUSDT") to the bytes32 marketId used by the vault. */
+export function symbolToMarketId(symbol: string): string {
+  return keccak256(toUtf8Bytes(symbol));
+}
+
+/**
+ * Returns the user's vault USDC balance already in x18 (wad) format.
+ * V2 is USDC-only — no ETH balance.
+ */
+export async function getUserBalancesWad(vault: Contract, user: string, _stableDecimals: number) {
+  // stableBalanceX18 already returns an x18 value — no scaling needed.
+  const stableX18 = (await (vault as any).stableBalanceX18(user)) as bigint;
+  return { stableWad: stableX18 as Wad };
+}
+
+export async function executeTradeVaultV2(
+  vault: Contract,
+  signer: Signer | null,
+  args: {
+    user: string;
+    marketId: string;
+    isLong: boolean;
+    sizeX18: Wad;
+    entryPriceX18: Wad;
+    collateralRaw: bigint;
+  },
+  opts?: { redis?: Redis; symbol?: string },
+) {
+  const c = signer ? vault.connect(signer) : vault;
+  const { user, marketId, isLong, sizeX18, entryPriceX18, collateralRaw } = args;
+
+  // ── Nonce + Gas overrides ────────────────────────────────────────────────
+  // Allocate a unique nonce through the serialised lock — prevents same-nonce
+  // collisions when two symbols fire executeTrade in the same scan tick.
+  // Compute EIP-1559 gas params (cached 3s) for safe inclusion on Arbitrum.
+  const wallet = signer as Wallet;
+  const [nonce, gasParams] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+
+  const overrides: Record<string, any> = { ...gasParams };
+  if (nonce !== undefined) overrides.nonce = nonce;
+
+  try {
+    const tx: TransactionResponse = await (c as any).executeTrade(
+      user, marketId, isLong, sizeX18, entryPriceX18, collateralRaw,
+      overrides,
+    );
+
+    // ── Record pending tx immediately after broadcast ────────────────────
+    // If the bot crashes during waitWithFallback, startup reconcilePendingTxs()
+    // will find this key and resolve it against the chain on next restart.
+    if (opts?.redis) {
+      await recordPendingTx(opts.redis, {
+        txHash:    tx.hash,
+        symbol:    opts.symbol ?? "unknown",
+        userKey:   user,
+        action:    "executeTrade",
+        timestamp: Date.now(),
+      });
+    }
+
+    // ethers v6: receipt.hash (not receipt.transactionHash)
+    const receipt = await waitWithFallback(tx);
+
+    // Clear the pending record now that we have a confirmed receipt
+    if (opts?.redis) {
+      await clearPendingTx(opts.redis, tx.hash);
+    }
+
+    return { txHash: receipt.hash, receipt };
+  } catch (err: any) {
+    // On nonce collision — resync from chain so next attempt gets a fresh nonce
+    if (wallet && classifyRevert(err) === "retry") {
+      await syncNonceFromChain(wallet).catch(() => {/* non-critical */});
+    }
+    throw err;
+  }
+}
+
+export async function closePositionVaultV2(
+  vault: Contract,
+  signer: Signer | null,
+  args: { user: string; marketId: string; exitPriceX18: Wad },
+  opts?: { redis?: Redis; symbol?: string },
+) {
+  const c = signer ? vault.connect(signer) : vault;
+  const { user, marketId, exitPriceX18 } = args;
+
+  const wallet = signer as Wallet;
+  const [nonce, gasParams] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+
+  const overrides: Record<string, any> = { ...gasParams };
+  if (nonce !== undefined) overrides.nonce = nonce;
+
+  try {
+    const tx: TransactionResponse = await (c as any).closePosition(user, marketId, exitPriceX18, overrides);
+
+    if (opts?.redis) {
+      await recordPendingTx(opts.redis, {
+        txHash:    tx.hash,
+        symbol:    opts.symbol ?? "unknown",
+        userKey:   user,
+        action:    "closePosition",
+        timestamp: Date.now(),
+      });
+    }
+
+    const receipt = await waitWithFallback(tx);
+
+    if (opts?.redis) {
+      await clearPendingTx(opts.redis, tx.hash);
+    }
+
+    return { txHash: receipt.hash, receipt };
+  } catch (err: any) {
+    if (wallet && classifyRevert(err) === "retry") {
+      await syncNonceFromChain(wallet).catch(() => {/* non-critical */});
+    }
+    throw err;
+  }
+}
+
+/**
+ * Approve the vault to spend `amountRaw` of the stable token, then call depositStable().
+ * amountRaw is in native token decimals (6 for USDC: 100 USDC = 100_000_000n).
+ * Deposit fee (depositFeeBps) is taken by the vault — net credited = amountRaw × (10000 - fee) / 10000.
+ */
+export async function depositStableToVault(
+  vault: Contract,
+  signer: Signer,
+  stableAddr: string,
+  vaultAddr: string,
+  amountRaw: bigint
+) {
+  const stable = new Contract(stableAddr, ERC20_ABI, signer);
+  // 1. Approve vault to spend tokens
+  const approveTx = await (stable as any).approve(vaultAddr, amountRaw);
+  await waitWithFallback(approveTx);
+  // 2. Deposit into vault
+  const vaultConnected = vault.connect(signer);
+  const depositTx = await (vaultConnected as any).depositStable(amountRaw);
+  const receipt = await waitWithFallback(depositTx);
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Normal two-step withdrawal (bot acts as both user + WITHDRAW_APPROVER_ROLE).
+ *
+ * Step 1: initiateWithdrawStable(amountRaw) — user locks withdrawal intent.
+ * Step 2: approveWithdrawStable(user, amountRaw) — approver releases funds minus withdrawFeeBps.
+ *
+ * amountRaw is in native token decimals (6 for USDC: 100 USDC = 100_000_000n).
+ * Net received = amountRaw × (10000 − withdrawFeeBps) / 10000  (e.g. 10% fee → 90% received).
+ */
+export async function withdrawStableFromVault(
+  vault: Contract,
+  signer: Signer,
+  userAddress: string,
+  amountRaw: bigint
+) {
+  const c = vault.connect(signer);
+  // Step 1 — initiate
+  const initTx = await (c as any).initiateWithdrawStable(amountRaw);
+  const initReceipt = await waitWithFallback(initTx);
+  // Step 2 — approve (bot is WITHDRAW_APPROVER_ROLE — completes immediately)
+  const approveTx = await (c as any).approveWithdrawStable(userAddress, amountRaw);
+  const approveReceipt = await waitWithFallback(approveTx);
+  return { initTxHash: initReceipt.hash, txHash: approveReceipt.hash, receipt: approveReceipt };
+}
+
+/**
+ * Emergency withdrawal — bypasses approval, costs emergencyFeeBps (15%).
+ *
+ * amountGrossRaw is in native token decimals (6 for USDC).
+ * Net received = amountGrossRaw × (10000 − emergencyFeeBps) / 10000.
+ */
+export async function emergencyWithdrawFromVault(
+  vault: Contract,
+  signer: Signer,
+  amountGrossRaw: bigint
+) {
+  const c = vault.connect(signer);
+  const tx = await (c as any).emergencyWithdrawStable(amountGrossRaw);
+  const receipt = await waitWithFallback(tx);
+  return { txHash: receipt.hash, receipt };
+}
+
+/**
+ * Returns the signer/wallet's stable token balance in raw units and formatted.
+ * decimals is typically 6 for USDC.
+ */
+export async function getWalletStableBalance(
+  provider: JsonRpcProvider,
+  stableAddr: string,
+  walletAddr: string,
+  decimals: number = 6
+) {
+  const stable = new Contract(stableAddr, ERC20_ABI, provider);
+  const raw = (await (stable as any).balanceOf(walletAddr)) as bigint;
+  const formatted = Number(raw) / 10 ** decimals;
+  return { raw: raw.toString(), formatted: +formatted.toFixed(2), decimals };
+}
