@@ -1281,9 +1281,11 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
 function LoginPage({
   onLogin,
   onRegister,
+  onForgot,
 }: {
   onLogin: (token: string) => void;
   onRegister: () => void;
+  onForgot?: () => void;
 }) {
   const [email,    setEmail]    = useState("");
   const [password, setPassword] = useState("");
@@ -1361,8 +1363,229 @@ function LoginPage({
           >
             Register
           </button>
+          {onForgot && (
+            <>
+              {" · "}
+              <button
+                onClick={onForgot}
+                style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", padding: 0, fontSize: "inherit", textDecoration: "underline" }}
+              >
+                Forgot password?
+              </button>
+            </>
+          )}
         </p>
         <p className="login-footer" style={{ marginTop: 4 }}>UrumTrader v1.0 · Arbitrum One</p>
+      </div>
+    </div>
+  );
+}
+
+// ── Subscription Banner ───────────────────────────────────────────────────────
+
+interface SubStatus { active: boolean; status: "trial" | "active" | "expired"; daysLeft: number; subscriptionUSDC: number; }
+
+function SubscriptionBanner({ token }: { token: string | null }) {
+  const [sub, setSub] = useState<SubStatus | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+
+  useEffect(() => {
+    if (!token) return;
+    apiFetch("/subscription/status").then((r: any) => {
+      if (r.ok !== false) setSub(r as SubStatus);
+    }).catch(() => {});
+  }, [token]);
+
+  if (!sub || dismissed) return null;
+
+  // Active/trial with plenty of days — hide banner to reduce noise
+  if (sub.active && sub.daysLeft > 3) return null;
+
+  const isExpired  = sub.status === "expired";
+  const isTrialEnd = sub.status === "trial" && sub.daysLeft <= 3;
+  const isSubEnd   = sub.status === "active" && sub.daysLeft <= 3;
+
+  if (!isExpired && !isTrialEnd && !isSubEnd) return null;
+
+  const bg      = isExpired ? "rgba(239,68,68,0.1)"  : "rgba(245,158,11,0.1)";
+  const border  = isExpired ? "rgba(239,68,68,0.3)"  : "rgba(245,158,11,0.3)";
+  const color   = isExpired ? "#EF4444" : "#F59E0B";
+  const message = isExpired
+    ? "⚠ Your subscription has expired. Trading has been paused."
+    : `⚠ ${sub.status === "trial" ? "Trial" : "Subscription"} expires in ${sub.daysLeft} day${sub.daysLeft !== 1 ? "s" : ""}.`;
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", background: bg, border: `1px solid ${border}`, borderRadius: 8, margin: "8px 12px 0", color, fontSize: 13, fontWeight: 500 }}>
+      <span style={{ flex: 1 }}>{message} Subscribe for ${sub.subscriptionUSDC} USDC/month to continue automated trading.</span>
+      <button onClick={() => setDismissed(true)} style={{ background: "none", border: "none", cursor: "pointer", color, padding: "2px 4px", lineHeight: 1 }}>✕</button>
+    </div>
+  );
+}
+
+// ── Risk Disclaimer Modal ─────────────────────────────────────────────────────
+
+const RISK_KEY = "urum_risk_accepted";
+
+function RiskDisclaimerModal({ onAccept }: { onAccept: () => void }) {
+  const [checked, setChecked] = useState(false);
+
+  function handleAccept() {
+    localStorage.setItem(RISK_KEY, "1");
+    onAccept();
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.82)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 2000, padding: 16 }}>
+      <div style={{ background: "#1a1d23", border: "1px solid #2a2d35", borderRadius: 14, padding: 28, maxWidth: 480, width: "100%", maxHeight: "90vh", overflow: "auto" }}>
+        <div style={{ textAlign: "center", marginBottom: 20 }}>
+          <AlertTriangle size={36} style={{ color: "#F59E0B" }} />
+          <h2 style={{ margin: "10px 0 4px", color: "var(--text-primary)" }}>Risk Disclosure</h2>
+          <p style={{ color: "var(--text-secondary)", fontSize: 13, margin: 0 }}>Please read before proceeding</p>
+        </div>
+
+        <div style={{ background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: 8, padding: "14px 16px", marginBottom: 16, fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.65 }}>
+          <strong style={{ color: "var(--text-primary)", display: "block", marginBottom: 8 }}>IMPORTANT RISK WARNING:</strong>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            <li style={{ marginBottom: 6 }}>Automated cryptocurrency trading involves <strong style={{ color: "#F59E0B" }}>substantial risk of loss</strong>. You could lose all your deposited funds.</li>
+            <li style={{ marginBottom: 6 }}>Leveraged trading (2×–5×) amplifies both profits and losses. A small adverse price move can wipe out your entire position.</li>
+            <li style={{ marginBottom: 6 }}>Past performance of the bot does NOT guarantee future results. Market conditions can change rapidly.</li>
+            <li style={{ marginBottom: 6 }}>UrumTrader is an <strong>automated trading tool</strong>, not financial advice. We are not licensed financial advisors.</li>
+            <li>Only deposit funds you can afford to lose entirely. Do not use borrowed money or funds needed for living expenses.</li>
+          </ul>
+        </div>
+
+        <div style={{ background: "rgba(0,212,170,0.06)", border: "1px solid rgba(0,212,170,0.2)", borderRadius: 8, padding: "12px 16px", marginBottom: 20, fontSize: 12, color: "var(--text-secondary)" }}>
+          <strong style={{ color: "var(--teal)" }}>Fee structure:</strong> Deposit: 5% · Normal withdrawal: 10% · Emergency: 15% · Profit share: 25% · Subscription: $20 USDC/month (14-day trial)
+        </div>
+
+        <label style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", marginBottom: 20 }}>
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={e => setChecked(e.target.checked)}
+            style={{ marginTop: 2, width: 16, height: 16, cursor: "pointer", accentColor: "var(--teal)" }}
+          />
+          <span style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+            I have read and understand the risks. I confirm that I am trading with funds I can afford to lose, and that I understand this is not financial advice.
+          </span>
+        </label>
+
+        <button
+          onClick={handleAccept}
+          disabled={!checked}
+          style={{
+            width: "100%",
+            padding: "12px 0",
+            borderRadius: 8,
+            border: "none",
+            cursor: checked ? "pointer" : "not-allowed",
+            background: checked ? "var(--teal)" : "#2a2d35",
+            color: checked ? "#000" : "#666",
+            fontWeight: 700,
+            fontSize: 15,
+            transition: "all 0.2s",
+          }}
+        >
+          I Understand — Continue to Dashboard
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Forgot Password Page ──────────────────────────────────────────────────────
+
+function ForgotPasswordPage({ onBack }: { onBack: () => void }) {
+  const [step,    setStep]    = useState<"email" | "reset" | "done">("email");
+  const [email,   setEmail]   = useState("");
+  // Read reset token from URL (e.g. /auth/reset-password?token=...)
+  const token = new URLSearchParams(window.location.search).get("token") ?? "";
+  const [newPw,   setNewPw]   = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  // If we arrived with a reset token in the URL, jump to the reset step
+  useEffect(() => {
+    if (token) setStep("reset");
+  }, []);
+
+  async function handleForgot(e: React.FormEvent) {
+    e.preventDefault();
+    setLoading(true); setError(null);
+    try {
+      const r = await fetch("/api/auth/forgot-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const d = await r.json();
+      if (d.ok) setMessage(d.message);
+      else setError(d.error ?? "Request failed");
+    } catch { setError("Network error"); }
+    finally { setLoading(false); }
+  }
+
+  async function handleReset(e: React.FormEvent) {
+    e.preventDefault();
+    if (newPw !== confirm) { setError("Passwords do not match"); return; }
+    if (newPw.length < 8)  { setError("Password must be at least 8 characters"); return; }
+    setLoading(true); setError(null);
+    try {
+      const r = await fetch("/api/auth/reset-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, newPassword: newPw }),
+      });
+      const d = await r.json();
+      if (d.ok) setStep("done");
+      else setError(d.error ?? "Reset failed");
+    } catch { setError("Network error"); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div className="login-overlay">
+      <div className="login-card">
+        <div className="login-logo">
+          <Bot size={36} style={{ color: "var(--teal)" }} />
+          <h1>{step === "done" ? "Password Updated!" : "Reset Password"}</h1>
+          <p>{step === "email" ? "Enter your email to receive a reset link" : step === "reset" ? "Choose a new password" : "You can now sign in with your new password"}</p>
+        </div>
+
+        {step === "done" && (
+          <button onClick={onBack} className="action-btn start-btn" style={{ width: "100%", justifyContent: "center" }}>
+            Back to Login
+          </button>
+        )}
+
+        {step === "email" && (
+          <form onSubmit={handleForgot} className="login-form">
+            <input type="email" className="login-input" placeholder="Email address" value={email} onChange={e => setEmail(e.target.value)} required autoFocus />
+            {error   && <div className="login-error"><AlertTriangle size={13} /> {error}</div>}
+            {message && <div style={{ fontSize: 13, color: "var(--teal)", padding: "8px 12px", background: "rgba(0,212,170,0.08)", borderRadius: 6 }}>{message}</div>}
+            <button type="submit" className="action-btn start-btn login-submit" disabled={loading} style={{ justifyContent: "center" }}>
+              {loading ? <RefreshCw size={14} className="spin" /> : <Send size={14} />}
+              {loading ? "Sending…" : "Send Reset Link"}
+            </button>
+            <p className="login-footer" style={{ textAlign: "center", marginTop: 12 }}>
+              <button type="button" onClick={onBack} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-secondary)", fontSize: 13 }}>← Back to Login</button>
+            </p>
+          </form>
+        )}
+
+        {step === "reset" && (
+          <form onSubmit={handleReset} className="login-form">
+            <input type="password" className="login-input" placeholder="New password (min 8 chars)" value={newPw} onChange={e => setNewPw(e.target.value)} required autoFocus />
+            <input type="password" className="login-input" placeholder="Confirm new password" value={confirm} onChange={e => setConfirm(e.target.value)} required />
+            {error && <div className="login-error"><AlertTriangle size={13} /> {error}</div>}
+            <button type="submit" className="action-btn start-btn login-submit" disabled={loading} style={{ justifyContent: "center" }}>
+              {loading ? <RefreshCw size={14} className="spin" /> : <CheckCircle size={14} />}
+              {loading ? "Updating…" : "Set New Password"}
+            </button>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -1538,7 +1761,12 @@ function RegisterPage({ onBack, onSuccess }: { onBack: () => void; onSuccess: ()
 export default function App() {
   // ── Auth ──
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
-  const [authView, setAuthView] = useState<"login" | "register">("login");
+  const [authView, setAuthView] = useState<"login" | "register" | "forgot">(() => {
+    // If URL has a reset token, go straight to forgot/reset flow
+    return new URLSearchParams(window.location.search).get("token") ? "forgot" : "login";
+  });
+  // ── Risk disclaimer — shown once per browser after first login ──
+  const [riskAccepted, setRiskAccepted] = useState<boolean>(() => !!localStorage.getItem(RISK_KEY));
 
   function handleLogin(t: string) {
     setToken(t);
@@ -1816,16 +2044,27 @@ export default function App() {
     e.type === "POSITION_CLOSED"
   );
 
-  // Gate: show login/register page if not authenticated
+  // Gate: show login/register/forgot page if not authenticated
   if (!token) {
     if (authView === "register") {
       return <RegisterPage onBack={() => setAuthView("login")} onSuccess={() => setAuthView("login")} />;
     }
-    return <LoginPage onLogin={handleLogin} onRegister={() => setAuthView("register")} />;
+    if (authView === "forgot") {
+      return <ForgotPasswordPage onBack={() => setAuthView("login")} />;
+    }
+    return <LoginPage onLogin={handleLogin} onRegister={() => setAuthView("register")} onForgot={() => setAuthView("forgot")} />;
+  }
+
+  // Risk disclaimer modal — shown once after first login
+  if (!riskAccepted) {
+    return <RiskDisclaimerModal onAccept={() => setRiskAccepted(true)} />;
   }
 
   return (
     <div className="app">
+      {/* ── Subscription banner (shown when trial/sub is expiring or expired) ── */}
+      <SubscriptionBanner token={token} />
+
       {/* ── Navbar ── */}
       <nav className="navbar">
         <div className="nav-brand">

@@ -373,6 +373,51 @@ http
         }
       }
 
+      // ── POST /auth/forgot-password ── request a password reset email ─────────
+      if (u.pathname === "/auth/forgot-password" && req.method === "POST") {
+        const ip = req.socket?.remoteAddress ?? "unknown";
+        if (!checkRateLimit(ip, 5)) return json(res, 429, { ok: false, error: "Too many attempts. Try again in a minute." });
+        try {
+          const b     = await readJson(req);
+          const email = String(b.email ?? "").trim().toLowerCase();
+          if (!email) return json(res, 400, { ok: false, error: "Email required" });
+          const redis = getRedis();
+          const user  = await getUserByEmail(redis, email);
+          // Always return 200 — prevents email enumeration
+          if (user && user.status === "active") {
+            const token = uuidv4();
+            await redis.set(`pwd-reset:${token}`, user.id, "EX", 3600); // 1h TTL
+            const { sendPasswordResetEmail } = await import("./services/email/mailer.js");
+            await sendPasswordResetEmail(user.email, token);
+            log.info({ email }, "[auth] password reset email sent");
+          }
+          return json(res, 200, { ok: true, message: "If that email is registered and active, a reset link has been sent." });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── POST /auth/reset-password ── set new password using token ────────────
+      if (u.pathname === "/auth/reset-password" && req.method === "POST") {
+        try {
+          const b           = await readJson(req);
+          const token       = String(b.token ?? "").trim();
+          const newPassword = String(b.newPassword ?? "").trim();
+          if (!token)       return json(res, 400, { ok: false, error: "Reset token required" });
+          if (!newPassword || newPassword.length < 8) return json(res, 400, { ok: false, error: "Password must be at least 8 characters" });
+          const redis  = getRedis();
+          const userId = await redis.get(`pwd-reset:${token}`);
+          if (!userId) return json(res, 400, { ok: false, error: "Invalid or expired reset link" });
+          const passwordHash = await bcrypt.hash(newPassword, 12);
+          await updateUser(redis, userId, { passwordHash });
+          await redis.del(`pwd-reset:${token}`); // one-time use
+          log.info({ userId }, "[auth] password reset successful");
+          return json(res, 200, { ok: true, message: "Password updated. You can now sign in." });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
       // ── GET /admin/users ────────────────────────────────────────────────────
       if (u.pathname === "/admin/users" && req.method === "GET") {
         const auth = await requireAdminRole(req);
