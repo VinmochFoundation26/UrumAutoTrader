@@ -439,18 +439,19 @@ http
         if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
         const userId = u.pathname.split("/")[3];
         try {
-          const b = await readJson(req);
-          const vaultAddress = String(b.vaultAddress ?? "").trim();
-          if (!vaultAddress) return json(res, 400, { ok: false, error: "vaultAddress required" });
           const user = await updateUser(getRedis(), userId, {
             status: "active",
-            vaultAddress,
             approvedAt: new Date().toISOString(),
           });
           if (!user) return json(res, 404, { ok: false, error: "user not found" });
-          await sendApprovalEmail(user.email, vaultAddress);
-          await auditLog(auth.userId, "approve", userId, `vault:${vaultAddress}`);
-          log.info({ adminId: auth.userId, userId, vaultAddress }, "[admin] user approved");
+          // Wallet is connected by the user after login — no vault address needed at approval
+          try {
+            await sendApprovalEmail(user.email, user.walletAddress ?? "");
+          } catch (emailErr: any) {
+            log.warn({ email: user.email, err: emailErr?.message }, "[admin] approval email failed");
+          }
+          await auditLog(auth.userId, "approve", userId);
+          log.info({ adminId: auth.userId, userId }, "[admin] user approved");
           return json(res, 200, { ok: true, message: "User approved" });
         } catch (e: any) {
           return json(res, 400, { ok: false, error: e?.message ?? "bad request" });

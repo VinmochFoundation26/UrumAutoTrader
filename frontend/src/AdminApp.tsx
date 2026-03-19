@@ -179,8 +179,7 @@ function AdminLoginPage({ onLogin }: { onLogin: (t: string) => void }) {
 
 // ── Approve Modal ─────────────────────────────────────────────────────────────
 
-function ApproveModal({ user, onApprove, onClose }: { user: AppUser; onApprove: (vault: string) => void; onClose: () => void }) {
-  const [vault,   setVault]   = useState("");
+function ApproveModal({ user, onApprove, onClose }: { user: AppUser; onApprove: () => void; onClose: () => void }) {
   const [loading, setLoading] = useState(false);
 
   return (
@@ -190,28 +189,19 @@ function ApproveModal({ user, onApprove, onClose }: { user: AppUser; onApprove: 
           <h3 style={{ margin: 0, color: "var(--teal)" }}>Approve User</h3>
           <button onClick={onClose} style={{ background: "none", border: "none", color: "#888", cursor: "pointer" }}><X size={18} /></button>
         </div>
-        <p style={{ color: "var(--text-secondary)", fontSize: 14, marginBottom: 16 }}>
-          User: <strong style={{ color: "var(--text-primary)" }}>{user.email}</strong><br />
-          Wallet: <code style={{ fontSize: 11 }}>{user.walletAddress || "—"}</code>
+        <p style={{ color: "var(--text-secondary)", fontSize: 14, marginBottom: 20 }}>
+          Approve <strong style={{ color: "var(--text-primary)" }}>{user.email}</strong>?<br /><br />
+          They will receive an approval email and can log in, connect their wallet, deposit funds and start trading.
         </p>
-        <label style={{ fontSize: 12, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>Vault Contract Address</label>
-        <input
-          className="login-input"
-          placeholder="0x..."
-          value={vault}
-          onChange={e => setVault(e.target.value)}
-          autoFocus
-          style={{ marginBottom: 16, fontFamily: "monospace", fontSize: 12 }}
-        />
         <div style={{ display: "flex", gap: 10 }}>
           <button className="action-btn stop-btn" onClick={onClose} style={{ flex: 1, justifyContent: "center" }}>Cancel</button>
           <button
             className="action-btn start-btn"
             style={{ flex: 1, justifyContent: "center" }}
-            disabled={loading || !vault.startsWith("0x")}
+            disabled={loading}
             onClick={async () => {
               setLoading(true);
-              await onApprove(vault);
+              await onApprove();
               setLoading(false);
             }}
           >
@@ -290,11 +280,8 @@ export default function AdminApp() {
     setTimeout(() => setMsg(null), 3500);
   }
 
-  async function approveUser(userId: string, vaultAddress: string) {
-    const r = await api<any>(`/admin/users/${userId}/approve`, {
-      method: "POST",
-      body: JSON.stringify({ vaultAddress }),
-    });
+  async function approveUser(userId: string) {
+    const r = await api<any>(`/admin/users/${userId}/approve`, { method: "POST" });
     if (r.ok) { flash("User approved — email sent"); fetchAll(); }
     else flash(`Error: ${r.error}`);
     setApproveTarget(null);
@@ -355,7 +342,7 @@ export default function AdminApp() {
       {approveTarget && (
         <ApproveModal
           user={approveTarget}
-          onApprove={(vault) => approveUser(approveTarget.id, vault)}
+          onApprove={() => approveUser(approveTarget.id)}
           onClose={() => setApproveTarget(null)}
         />
       )}

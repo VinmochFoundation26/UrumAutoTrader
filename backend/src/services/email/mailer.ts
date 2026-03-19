@@ -62,7 +62,7 @@ export async function sendVerificationEmail(to: string, token: string): Promise<
   });
 }
 
-export async function sendApprovalEmail(to: string, vaultAddress: string): Promise<void> {
+export async function sendApprovalEmail(to: string, _vaultAddress?: string): Promise<void> {
   await send({
     to,
     subject: "Your UrumTrader account has been approved!",
@@ -70,13 +70,10 @@ export async function sendApprovalEmail(to: string, vaultAddress: string): Promi
       <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
         <h2 style="color:#00D4AA">You're approved!</h2>
         <p>Your UrumTrader account has been reviewed and approved. You can now log in and start trading.</p>
-        <p><strong>Your vault address:</strong><br>
-          <code style="background:#f0f0f0;padding:4px 8px;border-radius:4px;font-size:13px">${vaultAddress}</code>
-        </p>
         <a href="${APP_URL}" style="display:inline-block;padding:12px 24px;background:#00D4AA;color:#000;border-radius:6px;text-decoration:none;font-weight:bold;margin:16px 0">
           Go to Dashboard
         </a>
-        <p style="color:#888;font-size:12px">Remember: Connect your MetaMask wallet to deposit funds and start automated trading.</p>
+        <p style="color:#888;font-size:12px">Once logged in, connect your MetaMask wallet, deposit USDC into your vault, and the bot will start trading automatically.</p>
       </div>
     `,
   });
