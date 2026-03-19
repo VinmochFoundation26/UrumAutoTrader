@@ -2103,35 +2103,62 @@ export default function App() {
 
   // ── No wallet — show setup screen instead of empty/shared dashboard ──
   if (!userWallet) {
+    const hasWeb3 = !!(window as any).ethereum;
+    const WALLETS = [
+      { name: "MetaMask",       url: "https://metamask.io/download/",         color: "#E2761B", icon: "🦊" },
+      { name: "Trust Wallet",   url: "https://trustwallet.com/download",       color: "#3375BB", icon: "🛡️" },
+      { name: "Coinbase Wallet",url: "https://www.coinbase.com/wallet/downloads", color: "#0052FF", icon: "🔵" },
+    ];
     return (
       <div className="login-overlay">
         <div className="login-card" style={{ textAlign: "center", maxWidth: 420 }}>
           <div className="login-logo">
             <Wallet size={36} style={{ color: "var(--teal)" }} />
-            <h1>Connect Your Wallet</h1>
-            <p>Link your MetaMask wallet to activate your trading vault and start the bot.</p>
+            <h1>Connect Web3 Wallet</h1>
+            <p>Link your wallet to activate your vault and start trading on Arbitrum.</p>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 8 }}>
-            <button
-              className="action-btn start-btn"
-              style={{ width: "100%", justifyContent: "center", fontSize: 15, padding: "12px 0" }}
-              onClick={async () => {
-                const eth = (window as any).ethereum;
-                if (!eth) { alert("MetaMask not found. Please install the MetaMask browser extension or app."); return; }
-                try {
-                  const accounts: string[] = await eth.request({ method: "eth_requestAccounts" });
-                  if (!accounts[0]) return;
-                  const r: any = await apiFetch("/auth/wallet", { method: "POST", body: JSON.stringify({ walletAddress: accounts[0] }) });
-                  if (r.ok !== false) setUserWallet(accounts[0]);
-                  else alert(r.error ?? "Failed to link wallet");
-                } catch (e: any) { alert(e?.message ?? "Wallet connection failed"); }
-              }}
-            >
-              <Wallet size={16} /> Connect MetaMask
-            </button>
-            <p style={{ color: "var(--text-secondary)", fontSize: 12, margin: 0 }}>
-              On mobile? Use MetaMask's built-in browser to visit urumtrader.com
-            </p>
+            {hasWeb3 ? (
+              /* Wallet extension detected — connect it */
+              <button
+                className="action-btn start-btn"
+                style={{ width: "100%", justifyContent: "center", fontSize: 15, padding: "12px 0" }}
+                onClick={async () => {
+                  try {
+                    const accounts: string[] = await (window as any).ethereum.request({ method: "eth_requestAccounts" });
+                    if (!accounts[0]) return;
+                    const r: any = await apiFetch("/auth/wallet", { method: "POST", body: JSON.stringify({ walletAddress: accounts[0] }) });
+                    if (r.ok !== false) setUserWallet(accounts[0]);
+                    else alert(r.error ?? "Failed to link wallet");
+                  } catch (e: any) { alert(e?.message ?? "Connection cancelled"); }
+                }}
+              >
+                <Wallet size={16} /> Connect Web3 Wallet
+              </button>
+            ) : (
+              /* No wallet found — show install options */
+              <>
+                <p style={{ color: "#ffaa00", fontSize: 13, margin: "0 0 4px", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  <AlertTriangle size={14} /> No wallet detected. Install one to continue:
+                </p>
+                {WALLETS.map(w => (
+                  <a
+                    key={w.name}
+                    href={w.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", background: "rgba(255,255,255,0.04)", border: `1px solid ${w.color}44`, borderRadius: 10, textDecoration: "none", color: "var(--text-primary)", fontSize: 14, fontWeight: 500 }}
+                  >
+                    <span style={{ fontSize: 22 }}>{w.icon}</span>
+                    <span>{w.name}</span>
+                    <span style={{ marginLeft: "auto", fontSize: 11, color: w.color }}>Install →</span>
+                  </a>
+                ))}
+                <p style={{ color: "var(--text-secondary)", fontSize: 12, margin: "4px 0 0" }}>
+                  On mobile: open this site inside your wallet's built-in browser.
+                </p>
+              </>
+            )}
             <button onClick={handleLogout} style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: 13, marginTop: 4 }}>
               Log out
             </button>
