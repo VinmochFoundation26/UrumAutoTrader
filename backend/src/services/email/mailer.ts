@@ -1,54 +1,47 @@
-// ── Mailer — Gmail SMTP via Nodemailer ────────────────────────────────────────
+// ── Mailer — Resend API ────────────────────────────────────────────────────────
 // Env vars required:
-//   GMAIL_USER          — sender Gmail address
-//   GMAIL_APP_PASSWORD  — Google App Password (16-char, no spaces)
-//   ADMIN_EMAIL         — admin notification recipient
-//   APP_URL             — e.g. https://urumtrader.com
+//   RESEND_API_KEY  — from resend.com dashboard (re_xxxxxxx)
+//   ADMIN_EMAIL     — admin notification recipient
+//   APP_URL         — e.g. https://urumtrader.com
+//
+// From address: "UrumTrader <onboarding@resend.dev>" (works without domain verification)
+// For custom from address (e.g. noreply@urumtrader.com): verify domain at resend.com
 
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 
-const GMAIL_USER = process.env.GMAIL_USER ?? "";
-const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD ?? "";
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? GMAIL_USER;
-const APP_URL = (process.env.APP_URL ?? "https://urumtrader.com").replace(
-  /\/$/,
-  ""
-);
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
+const ADMIN_EMAIL   = process.env.ADMIN_EMAIL ?? "";
+const APP_URL       = (process.env.APP_URL ?? "https://urumtrader.com").replace(/\/$/, "");
 
-function createTransport() {
-  return nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: GMAIL_USER,
-      pass: GMAIL_APP_PASSWORD,
-    },
-  });
+// Resend's default test address works without domain verification
+// Switch to your own domain once DNS is verified in Resend dashboard
+const FROM_ADDRESS  = process.env.RESEND_FROM ?? "UrumTrader <onboarding@resend.dev>";
+
+function getClient(): Resend {
+  return new Resend(RESEND_API_KEY);
 }
 
-async function send(opts: {
-  to: string;
-  subject: string;
-  html: string;
-}): Promise<void> {
-  if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
-    console.warn("[mailer] GMAIL_USER or GMAIL_APP_PASSWORD not set — skipping email:", opts.subject);
+async function send(opts: { to: string; subject: string; html: string }): Promise<void> {
+  if (!RESEND_API_KEY) {
+    console.warn("[mailer] RESEND_API_KEY not set — skipping email:", opts.subject);
     return;
   }
-  const transport = createTransport();
-  await transport.sendMail({
-    from: `"UrumTrader" <${GMAIL_USER}>`,
-    to: opts.to,
+  const resend = getClient();
+  const { error } = await resend.emails.send({
+    from:    FROM_ADDRESS,
+    to:      opts.to,
     subject: opts.subject,
-    html: opts.html,
+    html:    opts.html,
   });
+  if (error) {
+    console.error("[mailer] Resend error:", error.message);
+    throw new Error(`Email send failed: ${error.message}`);
+  }
 }
 
 // ── Email templates ───────────────────────────────────────────────────────────
 
-export async function sendVerificationEmail(
-  to: string,
-  token: string
-): Promise<void> {
+export async function sendVerificationEmail(to: string, token: string): Promise<void> {
   const link = `${APP_URL}/auth/verify-email?token=${token}`;
   await send({
     to,
@@ -67,10 +60,7 @@ export async function sendVerificationEmail(
   });
 }
 
-export async function sendApprovalEmail(
-  to: string,
-  vaultAddress: string
-): Promise<void> {
+export async function sendApprovalEmail(to: string, vaultAddress: string): Promise<void> {
   await send({
     to,
     subject: "Your UrumTrader account has been approved!",
@@ -104,9 +94,8 @@ export async function sendRejectionEmail(to: string): Promise<void> {
   });
 }
 
-export async function sendAdminNewUserAlert(
-  newUserEmail: string
-): Promise<void> {
+export async function sendAdminNewUserAlert(newUserEmail: string): Promise<void> {
+  if (!ADMIN_EMAIL) return;
   await send({
     to: ADMIN_EMAIL,
     subject: `New user registration: ${newUserEmail}`,
@@ -123,10 +112,7 @@ export async function sendAdminNewUserAlert(
   });
 }
 
-export async function sendPasswordResetEmail(
-  to: string,
-  token: string
-): Promise<void> {
+export async function sendPasswordResetEmail(to: string, token: string): Promise<void> {
   const link = `${APP_URL}/auth/reset-password?token=${token}`;
   await send({
     to,
