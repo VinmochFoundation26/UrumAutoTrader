@@ -26,8 +26,8 @@ jobs:
         working-directory: backend
         run: npm run build
 
-      - name: Package dist
-        run: tar -czf /tmp/backend-dist.tar.gz -C backend dist/
+      - name: Package dist + package files
+        run: tar -czf /tmp/backend-dist.tar.gz -C backend dist/ package.json package-lock.json
 
       - name: Deploy via webhook
         run: |
