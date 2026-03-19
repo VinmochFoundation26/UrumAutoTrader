@@ -29,25 +29,19 @@ jobs:
       - name: Package dist
         run: tar -czf /tmp/backend-dist.tar.gz -C backend dist/
 
-      - name: Setup SSH
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Deploy via webhook
         run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p 2222 -H 147.93.61.250 >> ~/.ssh/known_hosts 2>/dev/null || true
-
-      - name: Upload dist to server
-        run: scp -P 2222 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no /tmp/backend-dist.tar.gz root@147.93.61.250:/tmp/
-
-      - name: Deploy on server
-        run: |
-          ssh -p 2222 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no root@147.93.61.250 << 'ENDSSH'
-            tar -xzf /tmp/backend-dist.tar.gz -C /tmp/
-            docker cp /tmp/dist/. autotrader-backend-1:/app/dist/
-            docker restart autotrader-backend-1
-            sleep 5
-            docker exec autotrader-backend-1 wget -qO- http://localhost:5050/health
-          ENDSSH
-# triggered
+          STATUS=$(curl -s -o /tmp/deploy-response.txt -w "%{http_code}" \
+            -X POST \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @/tmp/backend-dist.tar.gz \
+            --max-time 120 \
+            https://urumtrader.com/deploy-hook)
+          echo "Response: $(cat /tmp/deploy-response.txt)"
+          echo "HTTP Status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Deploy failed!"
+            exit 1
+          fi
+          echo "Deploy successful!"
