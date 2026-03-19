@@ -106,7 +106,6 @@ interface BacktestResult {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const USER = import.meta.env.VITE_USER_ADDRESS ?? "0x5520C8A946e948C4f5d55e7e2FdEa7Bd5b25db85";
 const TOKEN_KEY = "at_token"; // sessionStorage key for JWT
 
 /** Decode JWT payload without verification (client-side only) */
@@ -1794,6 +1793,7 @@ function RegisterPage({ onBack, onSuccess }: { onBack: () => void; onSuccess: ()
 export default function App() {
   // ── Auth ──
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
+  const [userWallet, setUserWallet] = useState<string>("");
   const [authView, setAuthView] = useState<"login" | "register" | "forgot">(() => {
     // If URL has a reset token, go straight to forgot/reset flow
     return new URLSearchParams(window.location.search).get("token") ? "forgot" : "login";
@@ -1853,6 +1853,14 @@ export default function App() {
   const [manualSizePct, setManualSizePct]   = useState(10);  // 10% of vault
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
+  // ── Fetch logged-in user's wallet address from profile ──
+  useEffect(() => {
+    if (!token) return;
+    apiFetch("/auth/me").then((r: any) => {
+      if (r.ok !== false && r.user?.walletAddress) setUserWallet(r.user.walletAddress);
+    }).catch(() => {});
+  }, [token]);
+
   // ── Uptime ticker ──
   useEffect(() => {
     const t = setInterval(() => {
@@ -1875,7 +1883,7 @@ export default function App() {
   // ── Poll vault balance ──
   const fetchBalance = useCallback(async () => {
     try {
-      const r: any = await apiFetch(`/vault/balances?user=${USER}`);
+      const r: any = await apiFetch(`/vault/balances?user=${userWallet}`);
       if (r.ok) setBalance(r.balances);
     } catch { }
   }, []);
@@ -1883,7 +1891,7 @@ export default function App() {
   // ── Poll positions ──
   const fetchPositions = useCallback(async () => {
     try {
-      const r: any = await apiFetch(`/vault/position?user=${USER}`);
+      const r: any = await apiFetch(`/vault/position?user=${userWallet}`);
       if (r.ok) {
         setPositions(r.positions ?? {});
         setOpenCount(r.openCount ?? 0);
@@ -1912,7 +1920,7 @@ export default function App() {
   // ── Wallet + vault balance for deposit/withdraw panel ──
   const fetchWalletBalance = useCallback(async () => {
     try {
-      const r: any = await apiFetch(`/vault/wallet-balance?user=${USER}`);
+      const r: any = await apiFetch(`/vault/wallet-balance?user=${userWallet}`);
       if (r.ok) setWalletData(r as WalletData);
     } catch { }
   }, []);
@@ -2095,6 +2103,33 @@ export default function App() {
 
   return (
     <div className="app">
+      {/* ── Connect Wallet banner — shown when user has no wallet linked ── */}
+      {!userWallet && (
+        <div style={{ background: "rgba(255,170,0,0.12)", borderBottom: "1px solid rgba(255,170,0,0.3)", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 13, color: "#ffaa00", display: "flex", alignItems: "center", gap: 8 }}>
+            <AlertTriangle size={14} /> No wallet connected — connect MetaMask to deposit funds and start trading.
+          </span>
+          <button
+            className="action-btn start-btn"
+            style={{ padding: "6px 14px", fontSize: 12 }}
+            onClick={async () => {
+              const eth = (window as any).ethereum;
+              if (!eth) { alert("MetaMask not found. Please install MetaMask extension."); return; }
+              try {
+                const accounts: string[] = await eth.request({ method: "eth_requestAccounts" });
+                if (!accounts[0]) return;
+                const wallet = accounts[0];
+                const r: any = await apiFetch("/auth/wallet", { method: "POST", body: JSON.stringify({ walletAddress: wallet }) });
+                if (r.ok !== false) { setUserWallet(wallet); }
+                else { alert(r.error ?? "Failed to link wallet"); }
+              } catch (e: any) { alert(e?.message ?? "Wallet connection failed"); }
+            }}
+          >
+            <Wallet size={13} /> Connect Wallet
+          </button>
+        </div>
+      )}
+
       {/* ── Subscription banner (shown when trial/sub is expiring or expired) ── */}
       <SubscriptionBanner token={token} />
 
@@ -2114,8 +2149,8 @@ export default function App() {
           )}
         </div>
         <div className="nav-right">
-          <span className="nav-address" title={USER}>
-            {USER.slice(0, 6)}…{USER.slice(-4)}
+          <span className="nav-address" title={userWallet}>
+            {userWallet ? `${userWallet.slice(0, 6)}…${userWallet.slice(-4)}` : "No wallet"}
           </span>
           {isRunning ? (
             <button className="btn btn-danger" onClick={handleStop} disabled={actionLoading}>
@@ -2479,7 +2514,7 @@ export default function App() {
               <div className="cfg-readonly-grid">
                 <div className="cfg-ro">
                   <span>User Address</span>
-                  <code>{config?.userAddress ?? USER}</code>
+                  <code>{config?.userAddress ?? userWallet}</code>
                 </div>
                 <div className="cfg-ro">
                   <span>Strategy</span>
