@@ -1,4 +1,4 @@
-// ── Mailer — Resend API ────────────────────────────────────────────────────────
+// ── Mailer — Resend HTTP API (no npm package, uses built-in fetch) ─────────────
 // Env vars required:
 //   RESEND_API_KEY  — from resend.com dashboard (re_xxxxxxx)
 //   ADMIN_EMAIL     — admin notification recipient
@@ -6,8 +6,6 @@
 //
 // From address: "UrumTrader <onboarding@resend.dev>" (works without domain verification)
 // For custom from address (e.g. noreply@urumtrader.com): verify domain at resend.com
-
-import { Resend } from "resend";
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 const ADMIN_EMAIL   = process.env.ADMIN_EMAIL ?? "";
@@ -17,25 +15,29 @@ const APP_URL       = (process.env.APP_URL ?? "https://urumtrader.com").replace(
 // Switch to your own domain once DNS is verified in Resend dashboard
 const FROM_ADDRESS  = process.env.RESEND_FROM ?? "UrumTrader <onboarding@resend.dev>";
 
-function getClient(): Resend {
-  return new Resend(RESEND_API_KEY);
-}
-
 async function send(opts: { to: string; subject: string; html: string }): Promise<void> {
   if (!RESEND_API_KEY) {
     console.warn("[mailer] RESEND_API_KEY not set — skipping email:", opts.subject);
     return;
   }
-  const resend = getClient();
-  const { error } = await resend.emails.send({
-    from:    FROM_ADDRESS,
-    to:      opts.to,
-    subject: opts.subject,
-    html:    opts.html,
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method:  "POST",
+    headers: {
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Content-Type":  "application/json",
+    },
+    body: JSON.stringify({
+      from:    FROM_ADDRESS,
+      to:      [opts.to],
+      subject: opts.subject,
+      html:    opts.html,
+    }),
   });
-  if (error) {
-    console.error("[mailer] Resend error:", error.message);
-    throw new Error(`Email send failed: ${error.message}`);
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Email send failed (${res.status}): ${body}`);
   }
 }
 
