@@ -1987,31 +1987,31 @@ export default function App() {
     }
   }
 
-  // ── Initial load ──
+  // ── Initial load — only when wallet is connected ──
   useEffect(() => {
+    if (!userWallet) return; // no wallet → dead dashboard, load nothing
     fetchState();
     fetchBalance();
     fetchPositions();
     fetchRisk();
     fetchAiStats();
-    fetchPerformance();  // load trade history immediately on app open
-
-    // Load history once
+    fetchPerformance();
     apiFetch<any>("/bot/history?limit=100").then(r => {
       if (r.ok) setEvents(r.events ?? []);
     }).catch(() => { });
-  }, [fetchState, fetchBalance, fetchPositions, fetchRisk, fetchAiStats, fetchPerformance]);
+  }, [userWallet, fetchState, fetchBalance, fetchPositions, fetchRisk, fetchAiStats, fetchPerformance]);
 
-  // ── Polling intervals ──
+  // ── Polling intervals — only when wallet is connected ──
   useEffect(() => {
+    if (!userWallet) return;
     const t1 = setInterval(fetchState, 10_000);
     const t2 = setInterval(fetchBalance, 30_000);
     const t3 = setInterval(fetchPositions, 15_000);
-    const t4 = setInterval(fetchRisk, 30_000);      // circuit breaker status every 30s
-    const t5 = setInterval(fetchAiStats, 60_000);   // AI model stats every 60s
-    const t6 = setInterval(fetchPerformance, 60_000); // trade history every 60s
+    const t4 = setInterval(fetchRisk, 30_000);
+    const t5 = setInterval(fetchAiStats, 60_000);
+    const t6 = setInterval(fetchPerformance, 60_000);
     return () => { clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); clearInterval(t5); clearInterval(t6); };
-  }, [fetchState, fetchBalance, fetchPositions, fetchRisk, fetchAiStats, fetchPerformance]);
+  }, [userWallet, fetchState, fetchBalance, fetchPositions, fetchRisk, fetchAiStats, fetchPerformance]);
 
   // ── Fetch prices when positions change ──
   useEffect(() => {
@@ -2101,34 +2101,48 @@ export default function App() {
     return <RiskDisclaimerModal onAccept={() => setRiskAccepted(true)} />;
   }
 
+  // ── No wallet — show setup screen instead of empty/shared dashboard ──
+  if (!userWallet) {
+    return (
+      <div className="login-overlay">
+        <div className="login-card" style={{ textAlign: "center", maxWidth: 420 }}>
+          <div className="login-logo">
+            <Wallet size={36} style={{ color: "var(--teal)" }} />
+            <h1>Connect Your Wallet</h1>
+            <p>Link your MetaMask wallet to activate your trading vault and start the bot.</p>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 8 }}>
+            <button
+              className="action-btn start-btn"
+              style={{ width: "100%", justifyContent: "center", fontSize: 15, padding: "12px 0" }}
+              onClick={async () => {
+                const eth = (window as any).ethereum;
+                if (!eth) { alert("MetaMask not found. Please install the MetaMask browser extension or app."); return; }
+                try {
+                  const accounts: string[] = await eth.request({ method: "eth_requestAccounts" });
+                  if (!accounts[0]) return;
+                  const r: any = await apiFetch("/auth/wallet", { method: "POST", body: JSON.stringify({ walletAddress: accounts[0] }) });
+                  if (r.ok !== false) setUserWallet(accounts[0]);
+                  else alert(r.error ?? "Failed to link wallet");
+                } catch (e: any) { alert(e?.message ?? "Wallet connection failed"); }
+              }}
+            >
+              <Wallet size={16} /> Connect MetaMask
+            </button>
+            <p style={{ color: "var(--text-secondary)", fontSize: 12, margin: 0 }}>
+              On mobile? Use MetaMask's built-in browser to visit urumtrader.com
+            </p>
+            <button onClick={handleLogout} style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: 13, marginTop: 4 }}>
+              Log out
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
-      {/* ── Connect Wallet banner — shown when user has no wallet linked ── */}
-      {!userWallet && (
-        <div style={{ background: "rgba(255,170,0,0.12)", borderBottom: "1px solid rgba(255,170,0,0.3)", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-          <span style={{ fontSize: 13, color: "#ffaa00", display: "flex", alignItems: "center", gap: 8 }}>
-            <AlertTriangle size={14} /> No wallet connected — connect MetaMask to deposit funds and start trading.
-          </span>
-          <button
-            className="action-btn start-btn"
-            style={{ padding: "6px 14px", fontSize: 12 }}
-            onClick={async () => {
-              const eth = (window as any).ethereum;
-              if (!eth) { alert("MetaMask not found. Please install MetaMask extension."); return; }
-              try {
-                const accounts: string[] = await eth.request({ method: "eth_requestAccounts" });
-                if (!accounts[0]) return;
-                const wallet = accounts[0];
-                const r: any = await apiFetch("/auth/wallet", { method: "POST", body: JSON.stringify({ walletAddress: wallet }) });
-                if (r.ok !== false) { setUserWallet(wallet); }
-                else { alert(r.error ?? "Failed to link wallet"); }
-              } catch (e: any) { alert(e?.message ?? "Wallet connection failed"); }
-            }}
-          >
-            <Wallet size={13} /> Connect Wallet
-          </button>
-        </div>
-      )}
 
       {/* ── Subscription banner (shown when trial/sub is expiring or expired) ── */}
       <SubscriptionBanner token={token} />
