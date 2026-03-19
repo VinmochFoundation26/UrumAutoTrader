@@ -188,7 +188,7 @@ http
         try { await getRedis().ping(); redisOk = true; } catch { /* non-fatal */ }
         return json(res, 200, {
           ok: true,
-          version: "1.0.0",
+          version: "1.1.0",
           uptime: Math.floor(process.uptime()),
           redis: redisOk ? "ok" : "degraded",
           bot: getState().running ? "running" : "stopped",
