@@ -319,7 +319,12 @@ http
 
           const passwordHash = await bcrypt.hash(password, 12);
           const user = await createUser(redis, { email, passwordHash, walletAddress });
-          await sendVerificationEmail(user.email, user.emailVerifyToken);
+          // Email is best-effort — don't fail registration if email provider errors
+          try {
+            await sendVerificationEmail(user.email, user.emailVerifyToken);
+          } catch (emailErr: any) {
+            log.warn({ email, err: emailErr?.message }, "[auth] verification email failed — user still created");
+          }
           log.info({ email, userId: user.id }, "[auth] new user registered");
           return json(res, 201, { ok: true, message: "Registration successful. Check your email to verify your address." });
         } catch (e: any) {
