@@ -1623,17 +1623,25 @@ function PendingApprovalPage({ onBack }: { onBack?: () => void }) {
 // ── Register Page ─────────────────────────────────────────────────────────────
 
 function RegisterPage({ onBack, onSuccess }: { onBack: () => void; onSuccess: () => void }) {
-  const [email,    setEmail]    = useState("");
-  const [password, setPassword] = useState("");
-  const [confirm,  setConfirm]  = useState("");
-  const [wallet,   setWallet]   = useState("");
-  const [loading,  setLoading]  = useState(false);
-  const [error,    setError]    = useState<string | null>(null);
-  const [done,     setDone]     = useState(false);
+  const [email,        setEmail]        = useState("");
+  const [password,     setPassword]     = useState("");
+  const [confirm,      setConfirm]      = useState("");
+  const [wallet,       setWallet]       = useState("");   // from MetaMask extension
+  const [manualWallet, setManualWallet] = useState("");   // typed manually (mobile)
+  const [showManual,   setShowManual]   = useState(false);
+  const [loading,      setLoading]      = useState(false);
+  const [error,        setError]        = useState<string | null>(null);
+  const [done,         setDone]         = useState(false);
+
+  const effectiveWallet = wallet || manualWallet.trim();
 
   async function connectWallet() {
     const eth = (window as any).ethereum;
-    if (!eth) { setError("MetaMask not found. Please install it first."); return; }
+    if (!eth) {
+      // No extension — show manual input for mobile users
+      setShowManual(true);
+      return;
+    }
     try {
       const accounts: string[] = await eth.request({ method: "eth_requestAccounts" });
       if (accounts[0]) setWallet(accounts[0]);
@@ -1647,13 +1655,14 @@ function RegisterPage({ onBack, onSuccess }: { onBack: () => void; onSuccess: ()
     setError(null);
     if (password !== confirm) { setError("Passwords do not match"); return; }
     if (password.length < 8)  { setError("Password must be at least 8 characters"); return; }
-    if (!wallet)               { setError("Please connect your MetaMask wallet"); return; }
+    if (manualWallet && !/^0x[0-9a-fA-F]{40}$/.test(manualWallet.trim()))
+      { setError("Invalid wallet address — must be 0x followed by 40 hex characters"); return; }
     setLoading(true);
     try {
       const r = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password, walletAddress: wallet }),
+        body: JSON.stringify({ email, password, walletAddress: effectiveWallet }),
       });
       const data = await r.json();
       if (data.ok) { setDone(true); }
@@ -1720,7 +1729,7 @@ function RegisterPage({ onBack, onSuccess }: { onBack: () => void; onSuccess: ()
             required
           />
 
-          {/* MetaMask wallet connect */}
+          {/* Wallet — MetaMask extension or manual entry */}
           {wallet ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", background: "rgba(0,212,170,0.08)", borderRadius: 8, border: "1px solid rgba(0,212,170,0.3)", marginBottom: 4 }}>
               <Wallet size={14} style={{ color: "var(--teal)", flexShrink: 0 }} />
@@ -1729,10 +1738,34 @@ function RegisterPage({ onBack, onSuccess }: { onBack: () => void; onSuccess: ()
               </span>
               <CheckCircle size={13} style={{ color: "var(--teal)", marginLeft: "auto" }} />
             </div>
+          ) : showManual ? (
+            <div>
+              <input
+                type="text"
+                className="login-input"
+                placeholder="Wallet address (0x…) — optional"
+                value={manualWallet}
+                onChange={e => setManualWallet(e.target.value)}
+                style={{ fontFamily: "monospace", fontSize: 12 }}
+              />
+              <p style={{ fontSize: 11, color: "var(--text-secondary)", margin: "4px 0 0", lineHeight: 1.4 }}>
+                You can also skip this and connect your wallet after logging in.
+              </p>
+            </div>
           ) : (
-            <button type="button" onClick={connectWallet} className="action-btn stop-btn" style={{ width: "100%", justifyContent: "center" }}>
-              <Wallet size={14} /> Connect MetaMask Wallet
-            </button>
+            <div>
+              <button type="button" onClick={connectWallet} className="action-btn stop-btn" style={{ width: "100%", justifyContent: "center" }}>
+                <Wallet size={14} /> Connect MetaMask Wallet
+              </button>
+              <p style={{ fontSize: 11, color: "var(--text-secondary)", margin: "6px 0 0", textAlign: "center", lineHeight: 1.4 }}>
+                On mobile?{" "}
+                <button type="button" onClick={() => setShowManual(true)}
+                  style={{ background: "none", border: "none", color: "var(--teal)", cursor: "pointer", padding: 0, fontSize: "inherit", textDecoration: "underline" }}>
+                  Enter address manually
+                </button>
+                {" "}or skip — you can connect later.
+              </p>
+            </div>
           )}
 
           {error && <div className="login-error"><AlertTriangle size={13} /> {error}</div>}

@@ -309,8 +309,9 @@ http
             return json(res, 400, { ok: false, error: "Valid email required" });
           if (!password || password.length < 8)
             return json(res, 400, { ok: false, error: "Password must be at least 8 characters" });
-          if (!walletAddress || !/^0x[0-9a-fA-F]{40}$/.test(walletAddress))
-            return json(res, 400, { ok: false, error: "Valid wallet address required" });
+          // Wallet address is optional at registration — user can link later via /auth/wallet
+          if (walletAddress && !/^0x[0-9a-fA-F]{40}$/.test(walletAddress))
+            return json(res, 400, { ok: false, error: "Invalid wallet address format" });
 
           const redis = getRedis();
           const existing = await getUserByEmail(redis, email);
