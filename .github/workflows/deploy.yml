@@ -1,4 +1,4 @@
-name: Deploy Backend to VPS
+name: Deploy to VPS
 
 on:
   push:
@@ -18,16 +18,34 @@ jobs:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
-      - name: Install dependencies
+      # ── Backend ──────────────────────────────────────────────────────────────
+      - name: Install backend dependencies
         working-directory: backend
         run: npm ci
 
-      - name: Build TypeScript
+      - name: Build backend TypeScript
         working-directory: backend
         run: npm run build
 
-      - name: Package dist + package files
-        run: tar -czf /tmp/backend-dist.tar.gz -C backend dist/ package.json package-lock.json
+      # ── Frontend ─────────────────────────────────────────────────────────────
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+        env:
+          VITE_API_URL: /api
+          VITE_USER_ADDRESS: "0xbb75Bd3585DD162bd18b08501757B7371218af85"
+
+      # ── Package & Deploy ─────────────────────────────────────────────────────
+      - name: Package all dist files
+        run: |
+          mkdir -p /tmp/deploy-pkg/frontend
+          cp -r backend/dist backend/package.json backend/package-lock.json /tmp/deploy-pkg/
+          cp -r frontend/dist /tmp/deploy-pkg/frontend/
+          tar -czf /tmp/deploy.tar.gz -C /tmp/deploy-pkg .
 
       - name: Deploy via webhook
         run: |
@@ -35,7 +53,7 @@ jobs:
             -X POST \
             -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
             -H "Content-Type: application/octet-stream" \
-            --data-binary @/tmp/backend-dist.tar.gz \
+            --data-binary @/tmp/deploy.tar.gz \
             --max-time 120 \
             https://urumtrader.com/deploy-hook)
           echo "Response: $(cat /tmp/deploy-response.txt)"
