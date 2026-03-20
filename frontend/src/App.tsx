@@ -2218,12 +2218,35 @@ export default function App() {
 
   // ── No wallet — show setup screen instead of empty/shared dashboard ──
   if (!userWallet) {
-    const hasWeb3 = !!(window as any).ethereum;
+    const hasWeb3  = !!(window as any).ethereum;
+    const isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
+    const siteUrl  = encodeURIComponent(window.location.origin);
+
+    // Deep-link URLs open the site inside the wallet's built-in browser
     const WALLETS = [
-      { name: "MetaMask",       url: "https://metamask.io/download/",         color: "#E2761B", icon: "🦊" },
-      { name: "Trust Wallet",   url: "https://trustwallet.com/download",       color: "#3375BB", icon: "🛡️" },
-      { name: "Coinbase Wallet",url: "https://www.coinbase.com/wallet/downloads", color: "#0052FF", icon: "🔵" },
+      {
+        name: "MetaMask",
+        icon: "🦊",
+        color: "#E2761B",
+        deepLink: `https://metamask.app.link/dapp/${window.location.host}`,
+        installUrl: "https://metamask.io/download/",
+      },
+      {
+        name: "Trust Wallet",
+        icon: "🛡️",
+        color: "#3375BB",
+        deepLink: `https://link.trustwallet.com/open_url?coin_id=60&url=${siteUrl}`,
+        installUrl: "https://trustwallet.com/download",
+      },
+      {
+        name: "Coinbase Wallet",
+        icon: "🔵",
+        color: "#0052FF",
+        deepLink: `https://go.cb-w.com/dapp?cb_url=${siteUrl}`,
+        installUrl: "https://www.coinbase.com/wallet/downloads",
+      },
     ];
+
     return (
       <div className="login-overlay">
         <div className="login-card" style={{ textAlign: "center", maxWidth: 420 }}>
@@ -2234,7 +2257,7 @@ export default function App() {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 8 }}>
             {hasWeb3 ? (
-              /* Wallet extension detected — connect it */
+              /* ── Wallet injected (desktop extension OR inside wallet browser) ── */
               <button
                 className="action-btn start-btn"
                 style={{ width: "100%", justifyContent: "center", fontSize: 15, padding: "12px 0" }}
@@ -2242,24 +2265,51 @@ export default function App() {
                   try {
                     const accounts: string[] = await (window as any).ethereum.request({ method: "eth_requestAccounts" });
                     if (!accounts[0]) return;
-                    const r: any = await apiFetch("/auth/wallet", { method: "POST", body: JSON.stringify({ walletAddress: accounts[0] }) });
+                    const r: any = await apiFetch("/auth/wallet", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ walletAddress: accounts[0] }) });
                     if (r.ok !== false) setUserWallet(accounts[0]);
                     else alert(r.error ?? "Failed to link wallet");
                   } catch (e: any) { alert(e?.message ?? "Connection cancelled"); }
                 }}
               >
-                <Wallet size={16} /> Connect Web3 Wallet
+                <Wallet size={16} /> Connect Wallet
               </button>
+            ) : isMobile ? (
+              /* ── Mobile: no injection — show deep-link "Open in Wallet" buttons ── */
+              <>
+                <div style={{ background: "rgba(0,212,170,0.07)", border: "1px solid rgba(0,212,170,0.2)", borderRadius: 8, padding: "10px 14px", fontSize: 13, color: "var(--teal)", marginBottom: 4 }}>
+                  Tap your wallet below to open this site inside it, then come back here to connect.
+                </div>
+                {WALLETS.map(w => (
+                  <a
+                    key={w.name}
+                    href={w.deepLink}
+                    style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 16px", background: "rgba(255,255,255,0.04)", border: `1px solid ${w.color}55`, borderRadius: 10, textDecoration: "none", color: "var(--text-primary)", fontSize: 14, fontWeight: 600 }}
+                  >
+                    <span style={{ fontSize: 24 }}>{w.icon}</span>
+                    <span style={{ flex: 1, textAlign: "left" }}>Open in {w.name}</span>
+                    <span style={{ fontSize: 18, color: w.color }}>→</span>
+                  </a>
+                ))}
+                <p style={{ color: "var(--text-secondary)", fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
+                  Don't have a wallet yet?{" "}
+                  {WALLETS.map((w, i) => (
+                    <span key={w.name}>
+                      <a href={w.installUrl} target="_blank" rel="noopener noreferrer" style={{ color: "var(--teal)" }}>{w.name}</a>
+                      {i < WALLETS.length - 1 ? " · " : ""}
+                    </span>
+                  ))}
+                </p>
+              </>
             ) : (
-              /* No wallet found — show install options */
+              /* ── Desktop: no extension installed ── */
               <>
                 <p style={{ color: "#ffaa00", fontSize: 13, margin: "0 0 4px", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                  <AlertTriangle size={14} /> No wallet detected. Install one to continue:
+                  <AlertTriangle size={14} /> No wallet extension detected.
                 </p>
                 {WALLETS.map(w => (
                   <a
                     key={w.name}
-                    href={w.url}
+                    href={w.installUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", background: "rgba(255,255,255,0.04)", border: `1px solid ${w.color}44`, borderRadius: 10, textDecoration: "none", color: "var(--text-primary)", fontSize: 14, fontWeight: 500 }}
@@ -2270,7 +2320,7 @@ export default function App() {
                   </a>
                 ))}
                 <p style={{ color: "var(--text-secondary)", fontSize: 12, margin: "4px 0 0" }}>
-                  On mobile: open this site inside your wallet's built-in browser.
+                  After installing, refresh this page to connect.
                 </p>
               </>
             )}
