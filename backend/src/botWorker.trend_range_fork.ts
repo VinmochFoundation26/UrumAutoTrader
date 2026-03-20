@@ -1095,6 +1095,41 @@ function computeVotesFork(
   const bullDiv = rsiBullishDivergence(closes, 14, 15);
   const bearDiv = rsiBearishDivergence(closes, 14, 15);
 
+  // ── Support / Resistance structure bonus votes ───────────────────────────
+  // Detect swing highs and swing lows from the last 50 candles.
+  // A pivot high = candle whose high is strictly greater than the 2 candles
+  // immediately to its left AND right (5-candle pivot window).
+  // A pivot low  = candle whose low  is strictly less    than the 2 neighbours.
+  // If the current price is within 0.5% of a recent swing HIGH → atResistance (+1 SHORT)
+  // If the current price is within 0.5% of a recent swing LOW  → atSupport   (+1 LONG)
+  let atSupport    = false;
+  let atResistance = false;
+  if (ohlcv && ohlcv.highs.length >= 10) {
+    const swingWindow = Math.min(50, ohlcv.highs.length);
+    const recentHighs = ohlcv.highs.slice(-swingWindow);
+    const recentLows  = ohlcv.lows.slice(-swingWindow);
+    const PIVOT_SIDE  = 2;          // candles on each side
+    const SR_TOL      = 0.005;      // 0.5% proximity tolerance
+
+    const pivotHighs: number[] = [];
+    const pivotLows:  number[] = [];
+
+    for (let i = PIVOT_SIDE; i < recentHighs.length - PIVOT_SIDE; i++) {
+      const h = recentHighs[i];
+      let isPivotHigh = true;
+      let isPivotLow  = true;
+      for (let j = 1; j <= PIVOT_SIDE; j++) {
+        if (recentHighs[i - j] >= h || recentHighs[i + j] >= h) isPivotHigh = false;
+        if (recentLows[i - j]  <= recentLows[i] || recentLows[i + j] <= recentLows[i]) isPivotLow = false;
+      }
+      if (isPivotHigh) pivotHighs.push(h);
+      if (isPivotLow)  pivotLows.push(recentLows[i]);
+    }
+
+    atResistance = pivotHighs.some(ph => Math.abs(last - ph) / ph <= SR_TOL);
+    atSupport    = pivotLows.some (pl => Math.abs(last - pl) / pl <= SR_TOL);
+  }
+
   // Trend mode: direction from regime TF (1h), trigger from 5m pullback
   if (t !== "NONE") {
     const mode: Votes["mode"] = "TREND";
@@ -1115,9 +1150,10 @@ function computeVotesFork(
       if (bullDiv) longVotes += 1;           // RSI bullish divergence bonus
       if (priceAboveEma20) longVotes += 1;   // above 5m EMA20 (+1 bonus)
       if (volOk) longVotes += 1;             // volume above 60% avg (+1 bonus)
+      if (atSupport) longVotes += 1;         // price at swing-low support (+1 bonus)
 
       const triggerSrc = crossUp ? "crossUp" : leftOS ? "leftOS" : momentumOk ? "momentum" : "none";
-      const reason = `Trend LONG (regime). pullbackOk=${pullbackOk} triggerOk=${triggerOk}(${triggerSrc}) rsiRising=${timingOk} ema20gate=${priceAboveEma20} volOk=${volOk} bullDiv=${bullDiv} votes=${longVotes}/${required}`;
+      const reason = `Trend LONG (regime). pullbackOk=${pullbackOk} triggerOk=${triggerOk}(${triggerSrc}) rsiRising=${timingOk} ema20gate=${priceAboveEma20} volOk=${volOk} bullDiv=${bullDiv} atSupport=${atSupport} votes=${longVotes}/${required}`;
       decided =
         triggerOk && longVotes >= required && longVotes > shortVotes
           ? "LONG" : "NONE";
@@ -1210,6 +1246,7 @@ function computeVotesFork(
       if (bearDiv) shortVotes += 1;                // RSI bearish divergence bonus
       if (priceBelowEma20) shortVotes += 1;        // below 5m EMA20 (+1 bonus)
       if (volOk) shortVotes += 1;                  // volume above 60% avg (+1 bonus)
+      if (atResistance) shortVotes += 1;            // price at swing-high resistance (+1 bonus)
 
       const triggerSrc = crossDown ? "crossDown" : leftOB ? "leftOB" : momentumOk ? "momentum" : "none";
       const reason =
@@ -1217,7 +1254,7 @@ function computeVotesFork(
         `rsiFalling=${timingOk} ema20=${priceBelowEma20} ` +
         `emaStack=${emaStackShort} adx=${adxVal != null ? adxVal.toFixed(1) : "n/a"}(ok=${adxOk}) ` +
         `atrExpanding=${atrExpanding}(ok=${atrGuardOk}) timeOk=${shortTimeOk} ` +
-        `volOk=${volOk} bearDiv=${bearDiv} votes=${shortVotes}/${shortRequired}`;
+        `volOk=${volOk} bearDiv=${bearDiv} atResistance=${atResistance} votes=${shortVotes}/${shortRequired}`;
 
       decided =
         triggerOk          &&
