@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy — UrumTrader</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.7; padding: 40px 20px 80px; }
+    .container { max-width: 760px; margin: 0 auto; }
+    .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 48px; }
+    .logo a { color: #00D4AA; text-decoration: none; font-weight: 700; font-size: 20px; }
+    .logo span { color: #6b7280; font-size: 14px; }
+    h1 { font-size: 32px; font-weight: 700; color: #f0f6fc; margin-bottom: 8px; }
+    .subtitle { color: #8b949e; font-size: 14px; margin-bottom: 48px; }
+    h2 { font-size: 18px; font-weight: 600; color: #f0f6fc; margin: 40px 0 12px; }
+    p { color: #8b949e; margin-bottom: 14px; }
+    ul { color: #8b949e; padding-left: 24px; margin-bottom: 14px; }
+    li { margin-bottom: 8px; }
+    a { color: #00D4AA; }
+    .back { display: inline-block; margin-top: 48px; color: #8b949e; text-decoration: none; font-size: 14px; }
+    .back:hover { color: #00D4AA; }
+    hr { border: none; border-top: 1px solid #21262d; margin: 40px 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">
+      <a href="/">UrumTrader</a>
+      <span>· Arbitrum One</span>
+    </div>
+
+    <h1>Privacy Policy</h1>
+    <p class="subtitle">Last updated: March 2026</p>
+
+    <p>UrumTrader ("we", "our", or "us") operates an automated cryptocurrency trading platform on the Arbitrum One network. This Privacy Policy explains what information we collect, how we use it, and your rights.</p>
+
+    <h2>1. Information We Collect</h2>
+    <p>We collect the following information when you register and use the platform:</p>
+    <ul>
+      <li><strong>Account data:</strong> Email address and a bcrypt-hashed password. We never store your plaintext password.</li>
+      <li><strong>Wallet address:</strong> Your Arbitrum wallet address, used to interact with the on-chain vault contract.</li>
+      <li><strong>Trading activity:</strong> Trade history, vault deposits and withdrawals, and bot configuration settings stored in our Redis database.</li>
+      <li><strong>Fee records:</strong> Deposit, withdrawal, and profit-share fee amounts for accounting purposes.</li>
+      <li><strong>Support messages:</strong> Any messages you submit via the in-app support widget.</li>
+    </ul>
+    <p>We do <strong>not</strong> collect payment card information, government IDs, or personal documents of any kind.</p>
+
+    <h2>2. How We Use Your Information</h2>
+    <ul>
+      <li>To operate the automated trading bot on your behalf</li>
+      <li>To process vault deposits and withdrawals via the on-chain smart contract</li>
+      <li>To send transactional emails (account verification, approval, password reset)</li>
+      <li>To calculate and collect platform fees as described in our fee schedule</li>
+      <li>To respond to support requests</li>
+      <li>To detect and prevent fraud or abuse</li>
+    </ul>
+
+    <h2>3. Blockchain Data</h2>
+    <p>All on-chain transactions (deposits, withdrawals, trades) are recorded permanently on the Arbitrum One blockchain. This data is public and outside our control. Your wallet address and transaction history are visible to anyone who inspects the blockchain.</p>
+
+    <h2>4. Data Sharing</h2>
+    <p>We do not sell your personal information. We may share data with:</p>
+    <ul>
+      <li><strong>Infrastructure providers:</strong> Our VPS host and Redis database provider, who process data on our behalf under confidentiality obligations.</li>
+      <li><strong>Error tracking:</strong> Sentry (sentry.io) receives anonymised error reports including stack traces. No personally identifiable information is sent to Sentry.</li>
+      <li><strong>Legal compliance:</strong> We may disclose information if required by law or to protect our legal rights.</li>
+    </ul>
+
+    <h2>5. Data Retention</h2>
+    <p>We retain your account data for as long as your account is active. If you request account deletion, we will remove your email, password hash, and personal settings within 30 days. On-chain transaction history cannot be deleted as it is stored on the public blockchain.</p>
+
+    <h2>6. Security</h2>
+    <p>We use industry-standard security measures including bcrypt password hashing, JWT session tokens with expiry, TLS encryption in transit, and Redis data persistence with regular backups. However, no system is 100% secure. Cryptocurrency trading carries inherent risks — please review our <a href="/terms.html">Terms of Service</a>.</p>
+
+    <h2>7. Your Rights</h2>
+    <p>Depending on your jurisdiction, you may have rights to access, correct, or delete your personal data. To exercise these rights, contact us via the in-app support widget or at the email address on file with your account.</p>
+
+    <h2>8. Cookies</h2>
+    <p>We use <code>sessionStorage</code> (not cookies) to store your JWT login token locally in your browser. This data never leaves your device and is cleared when you close your browser tab.</p>
+
+    <h2>9. Changes to This Policy</h2>
+    <p>We may update this policy from time to time. Material changes will be communicated via email or an in-app notification. Continued use of the platform after changes constitutes acceptance of the updated policy.</p>
+
+    <h2>10. Contact</h2>
+    <p>For privacy-related questions, please use the in-app support widget or contact your account administrator.</p>
+
+    <hr />
+    <a href="/" class="back">← Back to UrumTrader</a>
+  </div>
+</body>
+</html>

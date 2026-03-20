@@ -1398,7 +1398,12 @@ function LoginPage({
             </>
           )}
         </p>
-        <p className="login-footer" style={{ marginTop: 4 }}>UrumTrader v1.0 · Arbitrum One</p>
+        <p className="login-footer" style={{ marginTop: 4 }}>
+          UrumTrader v1.0 · Arbitrum One ·{" "}
+          <a href="/terms.html" style={{ color: "var(--text-secondary)", textDecoration: "underline" }}>Terms</a>
+          {" · "}
+          <a href="/privacy.html" style={{ color: "var(--text-secondary)", textDecoration: "underline" }}>Privacy</a>
+        </p>
       </div>
     </div>
   );
@@ -1555,6 +1560,13 @@ function RiskDisclaimerModal({ onAccept }: { onAccept: () => void }) {
 
         <div style={{ background: "rgba(0,212,170,0.06)", border: "1px solid rgba(0,212,170,0.2)", borderRadius: 8, padding: "12px 16px", marginBottom: 20, fontSize: 12, color: "var(--text-secondary)" }}>
           <strong style={{ color: "var(--teal)" }}>Fee structure:</strong> Deposit: 5% · Normal withdrawal: 10% · Emergency: 15% · Profit share: 25% · Subscription: $20 USDC/month (14-day trial)
+          <br />
+          <span style={{ marginTop: 6, display: "inline-block" }}>
+            By continuing you agree to our{" "}
+            <a href="/terms.html" target="_blank" rel="noreferrer" style={{ color: "var(--teal)" }}>Terms of Service</a>
+            {" "}and{" "}
+            <a href="/privacy.html" target="_blank" rel="noreferrer" style={{ color: "var(--teal)" }}>Privacy Policy</a>.
+          </span>
         </div>
 
         <label style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", marginBottom: 20 }}>
