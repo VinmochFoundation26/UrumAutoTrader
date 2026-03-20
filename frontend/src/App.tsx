@@ -1882,14 +1882,16 @@ export default function App() {
 
   // ── Poll vault balance ──
   const fetchBalance = useCallback(async () => {
+    if (!userWallet) return;
     try {
       const r: any = await apiFetch(`/vault/balances?user=${userWallet}`);
       if (r.ok) setBalance(r.balances);
     } catch { }
-  }, []);
+  }, [userWallet]);
 
   // ── Poll positions ──
   const fetchPositions = useCallback(async () => {
+    if (!userWallet) return;
     try {
       const r: any = await apiFetch(`/vault/position?user=${userWallet}`);
       if (r.ok) {
@@ -1897,7 +1899,7 @@ export default function App() {
         setOpenCount(r.openCount ?? 0);
       }
     } catch { }
-  }, []);
+  }, [userWallet]);
 
   // ── Fetch prices for open positions ──
   const fetchPrices = useCallback(async (pos: Record<string, Position>) => {
@@ -1919,11 +1921,12 @@ export default function App() {
 
   // ── Wallet + vault balance for deposit/withdraw panel ──
   const fetchWalletBalance = useCallback(async () => {
+    if (!userWallet) return;
     try {
       const r: any = await apiFetch(`/vault/wallet-balance?user=${userWallet}`);
       if (r.ok) setWalletData(r as WalletData);
     } catch { }
-  }, []);
+  }, [userWallet]);
 
   // ── Phase 3: Risk data (circuit breaker) ──
   const fetchRisk = useCallback(async () => {
