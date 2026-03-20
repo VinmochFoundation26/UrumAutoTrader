@@ -1,4 +1,20 @@
 import "dotenv/config";
+import * as Sentry from "@sentry/node";
+
+// ── Sentry — initialise before any other imports so it can instrument them ───
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV ?? "production",
+    tracesSampleRate: 0.1,       // 10% of requests traced — adjust as needed
+    ignoreErrors: [
+      // suppress transient network noise already handled locally
+      "ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "could not coalesce",
+      "missing response", "bad response",
+    ],
+  });
+}
+
 import http from "node:http";
 import { URL } from "node:url";
 import { v4 as uuidv4 } from "uuid";
@@ -1421,6 +1437,7 @@ http
     } catch (e: any) {
       recordError(e?.message ?? String(e));
       log.error({ err: e?.message, stack: e?.stack }, "[server] unhandled error");
+      Sentry.captureException(e);
       return json(res, 500, { ok: false, error: e?.message ?? "internal error" });
     }
   })
@@ -1483,6 +1500,7 @@ process.on("uncaughtException", (err: any) => {
   } else {
     log.error({ err: msg, stack: err?.stack }, "[process] uncaughtException");
     recordError(msg);
+    Sentry.captureException(err);
   }
 });
 
@@ -1490,6 +1508,7 @@ process.on("unhandledRejection", (reason: any) => {
   const msg = reason?.message ?? String(reason);
   log.warn({ err: msg }, "[process] unhandledRejection suppressed");
   recordError(msg);
+  Sentry.captureException(reason instanceof Error ? reason : new Error(msg));
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
