@@ -9,6 +9,7 @@ import {
   fastExitCheck,
 } from "../../botWorker.trend_range_fork.js";
 import { getLatestPrice } from "../market/priceStream.js";
+import { getFallbackPrice } from "../market/priceFeedFallback.js";
 import { makeEngineDeps } from "./deps.js";
 import { getUsdmFuturesSymbols } from "../market/binanceCandles.js";
 import { getVaultContract, getVaultReadContract, getFallbackProvider } from "../onchain/contractInstance.js";
@@ -22,6 +23,9 @@ import { extractFeatures, getAiScore } from "../ai/signalScorer.js";
 
 // ── Phase 1 (Execution Hardening) ─────────────────────────────────────────────
 import { reconcilePendingTxs } from "../onchain/txTracker.js";
+
+// ── Per-user trading config ────────────────────────────────────────────────────
+import { getUserTradingConfig } from "../users/userTradingConfig.js";
 
 type BotConfig = {
   TIMEFRAMES: string[];
@@ -222,8 +226,33 @@ export async function startEngine(args: {
   // Fork-only evaluator
   const evaluateUserSymbol = evalTrendRangeFork;
 
+  // ── Per-user trading config overrides ─────────────────────────────────────
+  // Admin can set per-user overrides for symbols, maxLeverage, maxConcurrentTrades,
+  // and riskPct via the admin API (GET/PATCH/DELETE /admin/users/:id/trading-config).
+  // These override the global bot.config.json values for this user only.
+  let userMaxConcurrent = MAX_CONCURRENT_TRADES;
+  let userMaxLeverage   = cfg.DEFAULT_LEVERAGE ?? 10;
+  let effectiveSymbols  = args.symbols;
+
+  if (deps.redis) {
+    try {
+      const userCfg = await getUserTradingConfig(deps.redis, args.userKey);
+      if (userCfg.maxConcurrentTrades) userMaxConcurrent = userCfg.maxConcurrentTrades;
+      if (userCfg.maxLeverage)         userMaxLeverage   = userCfg.maxLeverage;
+      if (userCfg.symbols?.length)     effectiveSymbols  = userCfg.symbols;
+      if (Object.keys(userCfg).length > 0) {
+        log.info(
+          { userKey: args.userKey, userCfg },
+          "[runner] per-user trading config applied"
+        );
+      }
+    } catch (e: any) {
+      log.warn({ err: e?.message }, "[runner] failed to load per-user trading config (non-fatal)");
+    }
+  }
+
   // ---- Symbol normalization ----
-  const requested = (args.symbols ?? [])
+  const requested = (effectiveSymbols ?? [])
     .map((s) => String(s).trim().toUpperCase())
     .filter(Boolean);
 
@@ -290,7 +319,7 @@ export async function startEngine(args: {
   // Only registers positions NOT already in activeTrades from Redis.
   // This handles the cold-start case where Redis has no data yet.
   log.info("[runner] recovering positions from on-chain");
-  await recoverOpenPositions(args.userKey, valid, cfg.DEFAULT_LEVERAGE ?? 10, deps);
+  await recoverOpenPositions(args.userKey, valid, userMaxLeverage, deps);
 
   lastRun = {
     userKey: args.userKey,
@@ -344,7 +373,7 @@ export async function startEngine(args: {
 
 try {
   openCount = await getOpenCount(userKey);
-  atCapacity = openCount >= MAX_CONCURRENT_TRADES;
+  atCapacity = openCount >= userMaxConcurrent;
 
   if (atCapacity) {
     deps.emit({
@@ -352,7 +381,7 @@ try {
       type: "ENTRY_BLOCKED",
       userKey,
       openCount,
-      reason: `max concurrent positions reached (${openCount}/${MAX_CONCURRENT_TRADES}); new entries blocked`,
+      reason: `max concurrent positions reached (${openCount}/${userMaxConcurrent}); new entries blocked`,
     });
     // DO NOT return; we still scan regime/entry TFs (exits + regime tracking)
   }
@@ -511,8 +540,44 @@ try {
     // already mutated the shared stoch state (prevK/prevD), causing crossUp/leftOS
     // to evaluate as impossible (K==K), so triggerOk is always false on the second pass.
     if (atCapacity) {
-      return { paper: true, reason: `max capacity (${openCount}/${MAX_CONCURRENT_TRADES}); entry disabled` };
+      return { paper: true, reason: `max capacity (${openCount}/${userMaxConcurrent}); entry disabled` };
     }
+
+    // ── Slippage guard ───────────────────────────────────────────────────────
+    // The scan runs every 10 seconds.  By the time the best candidate is
+    // selected and we reach this point, the market may have moved.  If the
+    // live WebSocket price has deviated more than SLIPPAGE_TOL (0.3%) from
+    // the price that triggered the signal, the entry would be at a stale
+    // price — we abort instead of chasing.
+    //
+    // 0.3% is chosen because:
+    //   • A 10-second scan lag on a typical altcoin = ~0.05–0.15% drift
+    //   • 0.3% allows for normal noise while blocking a genuine gap/spike
+    //   • At 10× leverage 0.3% slippage = 3% leveraged PnL degradation —
+    //     enough to materially shift the trade's expected value negative
+    const SLIPPAGE_TOL = 0.003; // 0.3%
+    // Use WS price; fall back to REST if WS is stale (Binance Futures → Bybit)
+    const liveNow  = getLatestPrice(best.symbol) ?? await getFallbackPrice(best.symbol).catch(() => null);
+    const scanPrice = Number(best.execArgs?.entryPriceWad ?? 0n) / 1e18;
+    if (liveNow != null && scanPrice > 0) {
+      const slippage = Math.abs(liveNow - scanPrice) / scanPrice;
+      if (slippage > SLIPPAGE_TOL) {
+        deps.emit({
+          ts: Date.now(),
+          type: "ENTRY_BLOCKED",
+          userKey: best.userKey,
+          symbol: best.symbol,
+          timeframe: best.timeframe,
+          reason: `slippage ${(slippage * 100).toFixed(3)}% > ${(SLIPPAGE_TOL * 100).toFixed(1)}% tolerance (scan=${scanPrice.toFixed(4)} live=${liveNow.toFixed(4)})`,
+        });
+        log.warn(
+          { symbol: best.symbol, scanPrice, liveNow, slippagePct: (slippage * 100).toFixed(3) },
+          "[runner] entry blocked — price slipped beyond tolerance since scan"
+        );
+        return;
+      }
+    }
+
     try {
       const result = await deps.executeTrade(best.execArgs);
 
@@ -571,7 +636,14 @@ try {
   const fastDeps = deps; // same deps object — shares redis, closePosition, emit
   exitMonitorTimer = setInterval(async () => {
     for (const sym of valid) {
-      const price = getLatestPrice(sym);
+      // Primary: Binance WebSocket cache (updated ~10–50×/s per symbol)
+      // Fallback: REST price from Binance Futures or Bybit if WS is stale/disconnected.
+      // The fallback is cached 800ms internally so REST is called at most ~1×/s per symbol
+      // even though this interval fires every 50ms.
+      let price = getLatestPrice(sym);
+      if (price == null) {
+        price = await getFallbackPrice(sym).catch(() => null);
+      }
       if (price == null) continue;
       try {
         await fastExitCheck(args.userKey, sym, price, fastDeps);

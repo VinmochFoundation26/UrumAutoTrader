@@ -10,6 +10,12 @@ import {
   updateUser, listAllUsers, deleteUser, seedAdminIfEmpty,
 } from "./services/users/userStore.js";
 import {
+  getUserTradingConfig,
+  patchUserTradingConfig,
+  deleteUserTradingConfig,
+  validateUserTradingConfig as validateUserTradingConfigInput,
+} from "./services/users/userTradingConfig.js";
+import {
   sendVerificationEmail, sendApprovalEmail, sendRejectionEmail,
   sendAdminNewUserAlert,
 } from "./services/email/mailer.js";
@@ -514,6 +520,42 @@ http
         await auditLog(auth.userId, "delete", userId);
         log.info({ adminId: auth.userId, userId }, "[admin] user deleted");
         return json(res, 200, { ok: true, message: "User deleted" });
+      }
+
+      // ── GET /admin/users/:id/trading-config ─────────────────────────────────
+      if (/^\/admin\/users\/[^/]+\/trading-config$/.test(u.pathname) && req.method === "GET") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        const cfg = await getUserTradingConfig(getRedis(), userId);
+        return json(res, 200, { ok: true, config: cfg });
+      }
+
+      // ── PATCH /admin/users/:id/trading-config ────────────────────────────────
+      if (/^\/admin\/users\/[^/]+\/trading-config$/.test(u.pathname) && req.method === "PATCH") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        try {
+          const body    = await readJson(req);
+          const patch   = validateUserTradingConfigInput(body);
+          const saved   = await patchUserTradingConfig(getRedis(), userId, patch);
+          await auditLog(auth.userId, "update_trading_config", userId);
+          log.info({ adminId: auth.userId, userId, patch }, "[admin] user trading config updated");
+          return json(res, 200, { ok: true, config: saved });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      // ── DELETE /admin/users/:id/trading-config ───────────────────────────────
+      if (/^\/admin\/users\/[^/]+\/trading-config$/.test(u.pathname) && req.method === "DELETE") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        await deleteUserTradingConfig(getRedis(), userId);
+        await auditLog(auth.userId, "delete_trading_config", userId);
+        return json(res, 200, { ok: true, message: "Trading config reset to global defaults" });
       }
 
       // ── GET /admin/stats ────────────────────────────────────────────────────

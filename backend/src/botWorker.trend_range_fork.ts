@@ -313,6 +313,11 @@ const activeTrades = new Map<string, ActiveTrade>();   // key: user:symbol
 // Regime timeframe (1h) direction memory — updated each tick before 5m entry
 const trendRegime = new Map<string, { dir: "LONG" | "SHORT" | "NONE"; updatedAt: number }>(); // key: user:symbol
 
+// 4h regime memory — updated by 4h scan, read by SHORT Guard 6
+// Requires the 4h chart to NOT be in a LONG regime before a SHORT fires.
+// Prevents shorting into a multi-hour uptrend (the root cause of March 2026 losses).
+const fourHourRegime = new Map<string, { dir: "LONG" | "SHORT" | "NONE"; updatedAt: number }>(); // key: user:symbol
+
 // stoch helpers
 const stochKHistory = new Map<string, number[]>(); // key: user:symbol:timeframe
 const prevK = new Map<string, number>();
@@ -1005,9 +1010,17 @@ function computeVotesFork(
     }
 
     const regime = { dir, updatedAt: Date.now() };
-    trendRegime.set(`${userKey}:${symbol}`, regime);
-    if ((deps as any).redis) {
-      saveTrendRegime((deps as any).redis, userKey, symbol, regime).catch(() => {});
+
+    if (timeframe === "4h") {
+      // 4h regime is stored separately — it gates SHORT entries (Guard 6) but
+      // does NOT replace the 1h trend regime used for entry direction.
+      fourHourRegime.set(`${userKey}:${symbol}`, regime);
+    } else {
+      // All other regime timeframes (1h, etc.) update the primary trend regime.
+      trendRegime.set(`${userKey}:${symbol}`, regime);
+      if ((deps as any).redis) {
+        saveTrendRegime((deps as any).redis, userKey, symbol, regime).catch(() => {});
+      }
     }
 
     return {
@@ -1251,6 +1264,18 @@ function computeVotesFork(
       // quality bar for a SHORT without touching LONG behaviour or config.
       const shortRequired = Math.min(required + 1, 9);
 
+      // ── Guard 6: 4h regime must not be LONG ─────────────────────────────────
+      // If the 4h chart is in a LONG regime (price > VWAP and EMA slope up),
+      // the multi-hour macro trend is bullish — a SHORT on the 5m/1h timeframe
+      // is contra-trend and historically produces the largest losses.
+      // This guard requires "4h" to be in TIMEFRAMES and a 4h scan to have run.
+      // Permissive when no 4h data yet (fourHourRegime not populated) so the
+      // guard never blocks on missing data — it only fires when the 4h VWAP
+      // calculation is confirmed bullish.
+      const fh = fourHourRegime.get(`${userKey}:${symbol}`);
+      const fourHourGuardOk = fh == null || fh.dir !== "LONG";
+      const fourHourDir = fh?.dir ?? "unknown";
+
       // ── Existing vote accumulation (unchanged) ─────────────────────────────
       shortVotes += 2;                              // direction weight (VWAP+slope regime)
       const pullbackOk = recentMax >= 45;           // RSI rose above mid
@@ -1271,7 +1296,8 @@ function computeVotesFork(
         `rsiFalling=${timingOk} ema20=${priceBelowEma20} ` +
         `emaStack=${emaStackShort} adx=${adxVal != null ? adxVal.toFixed(1) : "n/a"}(ok=${adxOk}) ` +
         `atrExpanding=${atrExpanding}(ok=${atrGuardOk}) timeOk=${shortTimeOk} ` +
-        `volOk=${volOk} bearDiv=${bearDiv} atResistance=${atResistance} votes=${shortVotes}/${shortRequired}`;
+        `volOk=${volOk} bearDiv=${bearDiv} atResistance=${atResistance} ` +
+        `4hRegime=${fourHourDir}(ok=${fourHourGuardOk}) votes=${shortVotes}/${shortRequired}`;
 
       decided =
         triggerOk          &&
@@ -1280,7 +1306,8 @@ function computeVotesFork(
         emaStackShort      &&   // Guard 3: 5m EMA stack is bearish
         adxOk              &&   // Guard 2: ADX ≥ 20 (or unavailable)
         atrGuardOk         &&   // Guard 4: ATR not expanding
-        shortTimeOk             // Guard 1: London/NY session only
+        shortTimeOk        &&   // Guard 1: London/NY session only
+        fourHourGuardOk         // Guard 6: 4h macro regime is not bullish
           ? "SHORT"
           : "NONE";
 

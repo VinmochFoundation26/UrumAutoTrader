@@ -33,11 +33,96 @@ function isNetworkError(err: any): boolean {
   return FALLBACK_ERROR_PATTERNS.some(p => msg.includes(p.toLowerCase()));
 }
 
-async function waitWithFallback(tx: TransactionResponse, retries = 3): Promise<any> {
+// ── TX Acceleration ───────────────────────────────────────────────────────────
+//
+// On Arbitrum, TXs normally confirm within 1-2 seconds via the sequencer.
+// A TX that hasn't landed in STUCK_TX_MS is almost certainly an RPC issue or
+// a rare sequencer hiccup — not a gas problem. We:
+//   1. Attempt receipt via the fallback RPC first (covers most RPC dead-node cases)
+//   2. If still no receipt after STUCK_TX_MS, resend with same nonce + GAS_BUMP_FACTOR
+//      to replace the original TX in the sequencer's queue.
+// The replacement TX is returned and awaited. If BOTH somehow confirm, the second
+// fails with "position already open" — a known handled revert that is already
+// classified as "abort" and does not open a ghost trade.
+//
+const STUCK_TX_MS      = 20_000;    // 20 seconds — very generous for Arbitrum
+const GAS_BUMP_FACTOR  = 1.15;      // 15% gas bump for replacement TX
+
+/**
+ * Wait for a transaction receipt using the primary provider.
+ * On RPC connectivity errors: retries on the fallback provider.
+ * On stuck TX (no receipt in STUCK_TX_MS): calls `onStuck()` to get a
+ * replacement TX (same nonce, bumped gas), then waits for that receipt.
+ *
+ * @param tx        The broadcast TransactionResponse to wait for.
+ * @param retries   RPC retry count (default 3).
+ * @param onStuck   Optional callback that resends with bumped gas; returns the
+ *                  replacement TransactionResponse (or null to give up).
+ */
+async function waitWithFallback(
+  tx:       TransactionResponse,
+  retries:  number = 3,
+  onStuck?: () => Promise<TransactionResponse | null>,
+): Promise<any> {
+  // ── Phase 1: race tx.wait() against a stuck-TX timeout ──────────────────
+  if (onStuck) {
+    const TIMEOUT_SENTINEL = Symbol("timeout");
+    const result = await Promise.race([
+      tx.wait().then(r => r),
+      new Promise<typeof TIMEOUT_SENTINEL>(resolve =>
+        setTimeout(() => resolve(TIMEOUT_SENTINEL), STUCK_TX_MS)
+      ),
+    ]).catch(err => { throw err; }); // surface tx.wait() errors immediately
+
+    if (result !== TIMEOUT_SENTINEL) {
+      // TX confirmed normally — validate status
+      const receipt = result as any;
+      if (receipt?.status === 0) throw new Error(`tx ${tx.hash} reverted on-chain (status=0)`);
+      return receipt;
+    }
+
+    // ── TX appears stuck ─────────────────────────────────────────────────
+    log.warn(
+      { txHash: tx.hash, stuckAfterMs: STUCK_TX_MS },
+      "[vaultAdapter] TX stuck — attempting replacement with bumped gas",
+    );
+
+    // Try the fallback RPC first (covers most "stuck on dead node" cases)
+    const fallback = getFallbackProvider();
+    if (fallback) {
+      const receipt = await fallback.getTransactionReceipt(tx.hash).catch(() => null);
+      if (receipt) {
+        if (receipt.status === 0) throw new Error(`tx ${tx.hash} reverted on-chain (status=0)`);
+        log.info({ txHash: tx.hash }, "[vaultAdapter] TX found confirmed on fallback RPC after stuck timeout");
+        return receipt;
+      }
+    }
+
+    // Fallback RPC also has no receipt — trigger gas-bump replacement TX
+    const replaceTx = await onStuck().catch(e => {
+      log.warn({ err: e?.message }, "[vaultAdapter] gas-bump respawn failed");
+      return null;
+    });
+
+    if (replaceTx) {
+      log.info({ origHash: tx.hash, replaceHash: replaceTx.hash },
+        "[vaultAdapter] replacement TX sent — waiting for confirmation");
+      // Fall through to retried wait on the replacement TX
+      return waitWithFallback(replaceTx, retries); // no onStuck: don't recurse infinitely
+    }
+    // If respawn failed, fall through to the standard retry loop below
+  }
+
+  // ── Phase 2: standard retry loop (no timeout guard, used on replacement TXs) ──
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       // First attempt: use primary provider via tx.wait()
-      if (attempt === 1) return await tx.wait();
+      if (attempt === 1) {
+        const receipt = await tx.wait();
+        if ((receipt as any)?.status === 0)
+          throw new Error(`tx ${tx.hash} reverted on-chain (status=0)`);
+        return receipt;
+      }
 
       // Subsequent attempts: poll fallback provider directly by tx hash
       const fallback = getFallbackProvider();
@@ -181,8 +266,38 @@ export async function executeTradeVaultV2(
       });
     }
 
+    // ── TX Acceleration: if TX is stuck for > STUCK_TX_MS, resend with bumped gas ──
+    // Uses the same nonce so the replacement replaces the original in the sequencer.
+    const onStuck = wallet ? async (): Promise<TransactionResponse | null> => {
+      try {
+        const bumpedGas = {
+          maxFeePerGas:         BigInt(Math.ceil(Number(gasParams.maxFeePerGas)         * GAS_BUMP_FACTOR)),
+          maxPriorityFeePerGas: BigInt(Math.ceil(Number(gasParams.maxPriorityFeePerGas) * GAS_BUMP_FACTOR)),
+          nonce: overrides.nonce, // same nonce — replaces stuck TX
+        };
+        log.warn(
+          { symbol: opts?.symbol, nonce: overrides.nonce,
+            maxFeeGwei: (Number(bumpedGas.maxFeePerGas) / 1e9).toFixed(4) },
+          "[vaultAdapter] executeTrade: sending gas-bump replacement TX",
+        );
+        const replaceTx: TransactionResponse = await (c as any).executeTrade(
+          user, marketId, isLong, sizeX18, entryPriceX18, collateralRaw, bumpedGas,
+        );
+        if (opts?.redis) {
+          await recordPendingTx(opts.redis, {
+            txHash: replaceTx.hash, symbol: opts.symbol ?? "unknown",
+            userKey: user, action: "executeTrade", timestamp: Date.now(),
+          });
+        }
+        return replaceTx;
+      } catch (e: any) {
+        log.warn({ err: e?.message }, "[vaultAdapter] executeTrade gas-bump failed");
+        return null;
+      }
+    } : undefined;
+
     // ethers v6: receipt.hash (not receipt.transactionHash)
-    const receipt = await waitWithFallback(tx);
+    const receipt = await waitWithFallback(tx, 3, onStuck);
 
     // Clear the pending record now that we have a confirmed receipt
     if (opts?.redis) {
@@ -230,7 +345,35 @@ export async function closePositionVaultV2(
       });
     }
 
-    const receipt = await waitWithFallback(tx);
+    const closeOnStuck = wallet ? async (): Promise<TransactionResponse | null> => {
+      try {
+        const bumpedGas = {
+          maxFeePerGas:         BigInt(Math.ceil(Number(gasParams.maxFeePerGas)         * GAS_BUMP_FACTOR)),
+          maxPriorityFeePerGas: BigInt(Math.ceil(Number(gasParams.maxPriorityFeePerGas) * GAS_BUMP_FACTOR)),
+          nonce: overrides.nonce,
+        };
+        log.warn(
+          { symbol: opts?.symbol, nonce: overrides.nonce,
+            maxFeeGwei: (Number(bumpedGas.maxFeePerGas) / 1e9).toFixed(4) },
+          "[vaultAdapter] closePosition: sending gas-bump replacement TX",
+        );
+        const replaceTx: TransactionResponse = await (c as any).closePosition(
+          user, marketId, exitPriceX18, bumpedGas,
+        );
+        if (opts?.redis) {
+          await recordPendingTx(opts.redis, {
+            txHash: replaceTx.hash, symbol: opts.symbol ?? "unknown",
+            userKey: user, action: "closePosition", timestamp: Date.now(),
+          });
+        }
+        return replaceTx;
+      } catch (e: any) {
+        log.warn({ err: e?.message }, "[vaultAdapter] closePosition gas-bump failed");
+        return null;
+      }
+    } : undefined;
+
+    const receipt = await waitWithFallback(tx, 3, closeOnStuck);
 
     if (opts?.redis) {
       await clearPendingTx(opts.redis, tx.hash);

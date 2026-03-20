@@ -1,6 +1,6 @@
 {
   "EMA_PERIODS": [9, 20, 50],
-  "TIMEFRAMES": ["1h", "5m"],
+  "TIMEFRAMES": ["4h", "1h", "5m"],
 
   "STOP_LOSS_PCT": 0.015,
   "EXIT_ON_PROFIT_REVERSAL": 0.03,
