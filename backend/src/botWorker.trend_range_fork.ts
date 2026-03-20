@@ -1329,7 +1329,14 @@ export async function evaluateUserSymbol(
     // Closing at the regime flip captures whatever residual value remains and
     // frees capital for a SHORT entry in the correct direction.
     const currentRegime = trendRegime.get(`${userKey}:${symbol}`);
+    // Minimum hold time before regime-flip can trigger (60 seconds).
+    // Prevents entering a LONG on a 5m signal and immediately closing it
+    // 10 seconds later when the 1h regime updates to SHORT — wasted gas fees.
+    const heldMs = Date.now() - t.openedAtMs;
+    const MIN_HOLD_MS = 60_000; // 60 seconds
+
     const isContraRegime =
+      heldMs >= MIN_HOLD_MS &&
       currentRegime != null && currentRegime.dir !== "NONE" &&
       ((t.isLong && currentRegime.dir === "SHORT") ||
        (!t.isLong && currentRegime.dir === "LONG"));

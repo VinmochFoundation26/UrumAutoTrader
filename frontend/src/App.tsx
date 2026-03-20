@@ -2009,7 +2009,7 @@ export default function App() {
     if (!userWallet) return;
     const t1 = setInterval(fetchState, 10_000);
     const t2 = setInterval(fetchBalance, 30_000);
-    const t3 = setInterval(fetchPositions, 15_000);
+    const t3 = setInterval(fetchPositions, 5_000);
     const t4 = setInterval(fetchRisk, 30_000);
     const t5 = setInterval(fetchAiStats, 60_000);
     const t6 = setInterval(fetchPerformance, 60_000);
