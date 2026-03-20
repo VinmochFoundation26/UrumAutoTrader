@@ -1197,6 +1197,61 @@ a:hover { text-decoration: underline; }
   margin-left: 4px;
 }
 
+/* ── Fee breakdown box (replaces single-line preview) ────────────────────── */
+.dw-fee-breakdown {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dw-fee-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+
+.dw-fee-label {
+  color: var(--text-secondary);
+}
+
+.dw-fee-val {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.dw-fee-row-deduct .dw-fee-label {
+  color: var(--muted);
+}
+
+.dw-fee-red {
+  color: #EF4444;
+}
+
+.dw-fee-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.dw-fee-row-net {
+  font-size: 13px;
+}
+
+.dw-fee-net-label {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.dw-fee-green {
+  color: var(--green);
+  font-weight: 700;
+}
+
 /* Emergency withdraw-all button variant */
 .dw-withdraw-all-emergency {
   border-color: color-mix(in srgb, var(--red) 40%, transparent);

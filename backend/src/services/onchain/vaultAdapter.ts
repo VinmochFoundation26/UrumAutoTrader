@@ -389,6 +389,42 @@ export async function closePositionVaultV2(
 }
 
 /**
+ * Transfer a USDC fee amount directly to the platform fee wallet.
+ * Used by the deposit flow (platform fee transferred before vault deposit)
+ * and can be used for any direct fee sweep.
+ *
+ * Requires FEE_WALLET_ADDRESS to be set in env. No-ops (returns null) if not set,
+ * so missing config never crashes the deposit — it just skips the transfer and logs a warning.
+ */
+export async function transferUsdcFee(
+  stableAddr: string,
+  signer:     Signer,
+  feeRaw:     bigint,
+  label:      string = "fee",
+): Promise<{ txHash: string } | null> {
+  const feeWallet = process.env.FEE_WALLET_ADDRESS;
+  if (!feeWallet) {
+    log.warn({ label, feeRaw: feeRaw.toString() },
+      "[vaultAdapter] FEE_WALLET_ADDRESS not set — platform fee transfer skipped");
+    return null;
+  }
+  if (feeRaw === 0n) return null;
+
+  try {
+    const stable = new Contract(stableAddr, ERC20_ABI, signer);
+    const tx = await (stable as any).transfer(feeWallet, feeRaw);
+    const receipt = await waitWithFallback(tx);
+    log.info({ label, feeRaw: feeRaw.toString(), feeWallet, txHash: receipt.hash },
+      "[vaultAdapter] platform fee transferred ✓");
+    return { txHash: receipt.hash };
+  } catch (e: any) {
+    log.error({ err: e?.message, label, feeRaw: feeRaw.toString() },
+      "[vaultAdapter] platform fee transfer failed");
+    throw e;
+  }
+}
+
+/**
  * Approve the vault to spend `amountRaw` of the stable token, then call depositStable().
  * amountRaw is in native token decimals (6 for USDC: 100 USDC = 100_000_000n).
  * Deposit fee (depositFeeBps) is taken by the vault — net credited = amountRaw × (10000 - fee) / 10000.

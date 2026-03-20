@@ -1113,12 +1113,6 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
     } finally { setLoading(false); }
   }
 
-  const feeLabel = mode === "deposit"
-    ? `${fees?.depositPct ?? "?"}% deposit fee`
-    : withdrawMode === "normal"
-      ? `${fees?.withdrawPct ?? "?"}% normal withdrawal fee`
-      : `${fees?.emergencyPct ?? "?"}% emergency fee (immediate, no approval wait)`;
-
   const net = previewNet();
 
   return (
@@ -1212,14 +1206,39 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
         <span className="dw-input-token">USDC</span>
       </div>
 
-      {/* Net preview */}
-      {net !== null && amount && (
-        <div className="dw-net-preview">
-          {mode === "deposit" ? "Credited to vault:" : "You receive:"}{" "}
-          <strong style={{ color: "var(--green)" }}>${net.toFixed(2)} USDC</strong>
-          <span className="dw-net-fee"> · {feeLabel}</span>
-        </div>
-      )}
+      {/* Fee breakdown */}
+      {net !== null && amount && (() => {
+        const gross   = parseFloat(amount);
+        const feeAmt  = +(gross - net).toFixed(2);
+        const feePct  = mode === "deposit" ? (fees?.depositPct ?? 0)
+          : withdrawMode === "normal" ? (fees?.withdrawPct ?? 0)
+          : (fees?.emergencyPct ?? 0);
+        return (
+          <div className="dw-fee-breakdown">
+            <div className="dw-fee-row">
+              <span className="dw-fee-label">Gross amount</span>
+              <span className="dw-fee-val">${gross.toFixed(2)} USDC</span>
+            </div>
+            <div className="dw-fee-row dw-fee-row-deduct">
+              <span className="dw-fee-label">Platform fee ({feePct}%)</span>
+              <span className="dw-fee-val dw-fee-red">−${feeAmt.toFixed(2)} USDC</span>
+            </div>
+            {mode === "withdraw" && withdrawMode === "normal" && (
+              <div className="dw-fee-row">
+                <span className="dw-fee-label" style={{ color: "var(--text-secondary)", fontSize: 11 }}>+ 25% profit share on gains (deducted at payout)</span>
+                <span className="dw-fee-val" style={{ fontSize: 11, color: "var(--text-secondary)" }}>at close</span>
+              </div>
+            )}
+            <div className="dw-fee-divider" />
+            <div className="dw-fee-row dw-fee-row-net">
+              <span className="dw-fee-label dw-fee-net-label">
+                {mode === "deposit" ? "Net credited to vault" : "Net you receive"}
+              </span>
+              <span className="dw-fee-val dw-fee-green">${net.toFixed(2)} USDC</span>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Feedback */}
       {err && <div className="dw-error">⚠ {err}</div>}
@@ -1390,8 +1409,12 @@ function LoginPage({
 interface SubStatus { active: boolean; status: "trial" | "active" | "expired"; daysLeft: number; subscriptionUSDC: number; }
 
 function SubscriptionBanner({ token }: { token: string | null }) {
-  const [sub, setSub] = useState<SubStatus | null>(null);
+  const [sub, setSub]             = useState<SubStatus | null>(null);
   const [dismissed, setDismissed] = useState(false);
+  const [paying, setPaying]       = useState(false);
+  const [payDone, setPayDone]     = useState(false);
+  const [payErr, setPayErr]       = useState<string | null>(null);
+  const [showConfirm, setShowConfirm] = useState(false);
 
   useEffect(() => {
     if (!token) return;
@@ -1403,26 +1426,98 @@ function SubscriptionBanner({ token }: { token: string | null }) {
   if (!sub || dismissed) return null;
 
   // Active/trial with plenty of days — hide banner to reduce noise
-  if (sub.active && sub.daysLeft > 3) return null;
+  if (sub.active && sub.daysLeft > 3 && !payDone) return null;
 
   const isExpired  = sub.status === "expired";
   const isTrialEnd = sub.status === "trial" && sub.daysLeft <= 3;
   const isSubEnd   = sub.status === "active" && sub.daysLeft <= 3;
 
-  if (!isExpired && !isTrialEnd && !isSubEnd) return null;
+  if (!isExpired && !isTrialEnd && !isSubEnd && !payDone) return null;
 
-  const bg      = isExpired ? "rgba(239,68,68,0.1)"  : "rgba(245,158,11,0.1)";
-  const border  = isExpired ? "rgba(239,68,68,0.3)"  : "rgba(245,158,11,0.3)";
-  const color   = isExpired ? "#EF4444" : "#F59E0B";
-  const message = isExpired
+  const bg     = isExpired ? "rgba(239,68,68,0.1)"  : payDone ? "rgba(0,212,170,0.1)" : "rgba(245,158,11,0.1)";
+  const border = isExpired ? "rgba(239,68,68,0.3)"  : payDone ? "rgba(0,212,170,0.3)" : "rgba(245,158,11,0.3)";
+  const color  = isExpired ? "#EF4444" : payDone ? "var(--green)" : "#F59E0B";
+
+  const message = payDone
+    ? `✓ Subscription renewed! You're active for another 30 days.`
+    : isExpired
     ? "⚠ Your subscription has expired. Trading has been paused."
     : `⚠ ${sub.status === "trial" ? "Trial" : "Subscription"} expires in ${sub.daysLeft} day${sub.daysLeft !== 1 ? "s" : ""}.`;
 
+  async function handleRenew() {
+    setPaying(true);
+    setPayErr(null);
+    try {
+      const r: any = await apiFetch("/subscription/pay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: sub!.subscriptionUSDC }),
+      });
+      if (!r.ok) throw new Error(r.error ?? "Payment failed");
+      setPayDone(true);
+      setShowConfirm(false);
+      // Re-fetch status to update local state
+      const fresh: any = await apiFetch("/subscription/status");
+      if (fresh.ok !== false) setSub(fresh as SubStatus);
+    } catch (e: any) {
+      setPayErr(e?.message ?? "Payment failed");
+    } finally {
+      setPaying(false);
+    }
+  }
+
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", background: bg, border: `1px solid ${border}`, borderRadius: 8, margin: "8px 12px 0", color, fontSize: 13, fontWeight: 500 }}>
-      <span style={{ flex: 1 }}>{message} Subscribe for ${sub.subscriptionUSDC} USDC/month to continue automated trading.</span>
-      <button onClick={() => setDismissed(true)} style={{ background: "none", border: "none", cursor: "pointer", color, padding: "2px 4px", lineHeight: 1 }}>✕</button>
-    </div>
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", background: bg, border: `1px solid ${border}`, borderRadius: 8, margin: "8px 12px 0", color, fontSize: 13, fontWeight: 500 }}>
+        <span style={{ flex: 1 }}>
+          {message}
+          {!payDone && (
+            <> Automated trading requires an active subscription (${sub.subscriptionUSDC} USDC/month).</>
+          )}
+          {payErr && <span style={{ color: "#EF4444", marginLeft: 8 }}>⚠ {payErr}</span>}
+        </span>
+        {!payDone && (
+          <button
+            onClick={() => setShowConfirm(true)}
+            disabled={paying}
+            style={{ background: isExpired ? "#EF4444" : "#F59E0B", color: "#fff", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontWeight: 600, fontSize: 12, whiteSpace: "nowrap", opacity: paying ? 0.6 : 1 }}
+          >
+            {paying ? "Processing…" : `Renew — $${sub.subscriptionUSDC} USDC`}
+          </button>
+        )}
+        <button onClick={() => setDismissed(true)} style={{ background: "none", border: "none", cursor: "pointer", color, padding: "2px 4px", lineHeight: 1, flexShrink: 0 }}>✕</button>
+      </div>
+
+      {/* Confirmation modal */}
+      {showConfirm && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 3000, padding: 16 }}>
+          <div style={{ background: "#1a1d23", border: "1px solid #2a2d35", borderRadius: 12, padding: 28, maxWidth: 400, width: "100%" }}>
+            <h3 style={{ margin: "0 0 12px", color: "var(--text)" }}>Confirm Subscription</h3>
+            <p style={{ color: "var(--text-secondary)", fontSize: 14, margin: "0 0 20px", lineHeight: 1.6 }}>
+              You are about to subscribe to UrumTrader for <strong style={{ color: "var(--text)" }}>${sub.subscriptionUSDC} USDC / month</strong>.<br /><br />
+              This will activate automated trading for <strong style={{ color: "var(--green)" }}>30 days</strong>.
+              Payment will be deducted from your vault balance.
+            </p>
+            {payErr && <div style={{ color: "#EF4444", fontSize: 13, marginBottom: 12 }}>⚠ {payErr}</div>}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={() => { setShowConfirm(false); setPayErr(null); }}
+                style={{ flex: 1, padding: "10px", background: "transparent", border: "1px solid #2a2d35", borderRadius: 8, color: "var(--text-secondary)", cursor: "pointer", fontSize: 14 }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleRenew}
+                disabled={paying}
+                style={{ flex: 1, padding: "10px", background: "var(--teal)", border: "none", borderRadius: 8, color: "#fff", cursor: "pointer", fontSize: 14, fontWeight: 600, opacity: paying ? 0.6 : 1 }}
+              >
+                {paying ? "Processing…" : `Pay $${sub.subscriptionUSDC} USDC`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -29,7 +29,7 @@ import { startEngine, stopEngine } from "./services/bot/runner.js";
 import { getState, setRunning, recordError, addSseClient, getEventHistory } from "./services/bot/state.js";
 import { getVaultBalances } from "./services/onchain/vaultViews.js";
 import { validateConfig, CFG_KEYS, symbolMaxLev } from "./botWorker.trend_range_fork.js";
-import { closePositionVaultV2, depositStableToVault, withdrawStableFromVault, emergencyWithdrawFromVault, getWalletStableBalance } from "./services/onchain/vaultAdapter.js";
+import { closePositionVaultV2, depositStableToVault, withdrawStableFromVault, emergencyWithdrawFromVault, getWalletStableBalance, transferUsdcFee } from "./services/onchain/vaultAdapter.js";
 import { getSigner, getVaultWriteContract, getProvider, getVaultAddress } from "./services/onchain/contractInstance.js";
 import { recordDeposit, recordWithdrawal, recordSubscriptionPayment, checkSubscription, getUserFeeStats, FEE } from "./services/fees/feeEngine.js";
 import { workerPool } from "./services/bot/workerPool.js";
@@ -712,6 +712,27 @@ http
         if (!currentUserAddress) return json(res, 400, { ok: false, error: "Set TEST_USER_ADDRESS env or POST /bot/set" });
         currentSymbols = normalizeSymbols(currentSymbols);
         if (!currentSymbols.length) return json(res, 400, { ok: false, error: "no valid symbols configured" });
+
+        // ── Subscription gate ─────────────────────────────────────────────────
+        // Block the bot from starting if the user's subscription (or trial) has expired.
+        // Admins bypass the check — they can always start the engine.
+        const startPayload = decodeToken(req);
+        const startUserId  = startPayload?.userId ?? "legacy";
+        if (startUserId !== "legacy" && startPayload?.role !== "admin") {
+          const startUser = await getUserById(getRedis(), startUserId).catch(() => null);
+          const subStatus = await checkSubscription(
+            getRedis(), startUserId, startUser?.trialExpiresAt ?? null
+          );
+          if (!subStatus.active) {
+            return json(res, 403, {
+              ok: false,
+              error: "Subscription expired — please renew to continue trading",
+              subscriptionStatus: subStatus,
+              renewUrl: "/subscription/pay",
+            });
+          }
+        }
+
         const r = await startBot({ userKey: currentUserAddress, symbols: currentSymbols, trigger: currentTrigger });
         setRunning(true);
         await persistEngineState(true);   // survive backend restart
@@ -1151,8 +1172,17 @@ http
           const signer    = getSigner();
           const writeC    = getVaultWriteContract();
           const vaultAddr = getVaultAddress();
-          log.info({ amount: amountUsdc, amountRaw: amountRaw.toString(), stableAddr }, "[vault] deposit initiated");
-          const r = await depositStableToVault(writeC, signer, stableAddr, vaultAddr, amountRaw);
+
+          // ── Platform fee: transfer 5% to FEE_WALLET before vault deposit ─────────
+          // Splits the deposit: 5% to platform fee wallet, 95% to user vault.
+          // FEE_WALLET_ADDRESS must be set in .env — skipped (with warning) if not set.
+          const STABLE_DECIMALS_NUM = Number(process.env.STABLE_DECIMALS ?? "6");
+          const feeRaw = BigInt(Math.round(Number(amountRaw) * FEE.DEPOSIT_BPS / FEE.BPS_DENOM));
+          const netRaw = amountRaw - feeRaw;
+          await transferUsdcFee(stableAddr, signer, feeRaw, "deposit-5pct");
+
+          log.info({ amount: amountUsdc, netRaw: netRaw.toString(), feeRaw: feeRaw.toString(), stableAddr }, "[vault] deposit initiated");
+          const r = await depositStableToVault(writeC, signer, stableAddr, vaultAddr, netRaw);
           log.info({ txHash: r.txHash, amount: amountUsdc }, "[vault] deposit confirmed");
           // Record platform fee
           const { fee: platformFee, net: netAfterFee } = await recordDeposit(getRedis(), userId, amountUsdc, r.txHash);
@@ -1208,14 +1238,27 @@ http
 
           const amountUsdc = Number(amountRaw) / 1_000_000;
 
+          // ── Calculate platform fees BEFORE initiating the withdrawal ──────────────
+          // We approve only the NET amount to the user — the fee portion stays in the
+          // vault and is swept to the platform fee wallet by the admin periodically.
+          // This prevents the user from receiving the full gross while avoiding the
+          // complexity of intercepting a direct vault-to-user USDC transfer.
+          const fees = await recordWithdrawal(getRedis(), userId, amountUsdc, vaultBalanceUsdc, mode, undefined);
+          const STABLE_DECIMALS_W = Number(process.env.STABLE_DECIMALS ?? "6");
+          const netRawW  = BigInt(Math.max(0, Math.round(fees.net  * 10 ** STABLE_DECIMALS_W)));
+          // Guard: never initiate a zero withdrawal
+          if (netRawW === 0n) {
+            return json(res, 400, { ok: false, error: "Withdrawal amount is fully consumed by fees", fees });
+          }
+
           if (mode === "emergency") {
             // Emergency: single call, bypasses approval — higher fee (15%)
-            log.info({ amount: amountUsdc, amountRaw: amountRaw.toString() }, "[vault] emergency withdraw initiated");
-            const r = await emergencyWithdrawFromVault(writeC, signer, amountRaw);
+            log.info({ amount: amountUsdc, netRaw: netRawW.toString(), fees }, "[vault] emergency withdraw initiated");
+            const r = await emergencyWithdrawFromVault(writeC, signer, netRawW);
             const feeBps: bigint = await readC.emergencyFeeBps();
-            const contractNetReceived = +(amountUsdc * Number(10_000n - feeBps) / 10_000).toFixed(2);
-            // Record platform fees (withdraw fee + profit share)
-            const fees = await recordWithdrawal(getRedis(), userId, amountUsdc, vaultBalanceUsdc, "emergency", r.txHash);
+            const contractNetReceived = +(fees.net * Number(10_000n - feeBps) / 10_000).toFixed(2);
+            // Update fee log with txHash now that we have it
+            await recordWithdrawal(getRedis(), userId, 0, vaultBalanceUsdc, "emergency", r.txHash).catch(() => {});
             log.info({ txHash: r.txHash, contractNetReceived, platformFees: fees }, "[vault] emergency withdraw confirmed");
             return json(res, 200, {
               ok: true, txHash: r.txHash, type: "emergency",
@@ -1228,13 +1271,11 @@ http
               netReceived: fees.net,
             });
           } else {
-            // Normal: initiate (user) → approve (bot as WITHDRAW_APPROVER_ROLE)
-            log.info({ amount: amountUsdc, amountRaw: amountRaw.toString() }, "[vault] normal withdraw initiated");
-            const r = await withdrawStableFromVault(writeC, signer, user, amountRaw);
+            // Normal: initiate + approve for NET amount only (fee stays in vault)
+            log.info({ amount: amountUsdc, netRaw: netRawW.toString(), fees }, "[vault] normal withdraw initiated");
+            const r = await withdrawStableFromVault(writeC, signer, user, netRawW);
             const feeBps: bigint = await readC.withdrawFeeBps();
-            const contractNetReceived = +(amountUsdc * Number(10_000n - feeBps) / 10_000).toFixed(2);
-            // Record platform fees (withdraw fee + profit share)
-            const fees = await recordWithdrawal(getRedis(), userId, amountUsdc, vaultBalanceUsdc, "normal", r.txHash);
+            const contractNetReceived = +(fees.net * Number(10_000n - feeBps) / 10_000).toFixed(2);
             log.info({ initTxHash: r.initTxHash, txHash: r.txHash, contractNetReceived, platformFees: fees }, "[vault] normal withdraw confirmed");
             return json(res, 200, {
               ok: true, initTxHash: r.initTxHash, txHash: r.txHash, type: "normal",
