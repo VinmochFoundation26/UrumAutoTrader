@@ -1432,7 +1432,31 @@ export async function evaluateUserSymbol(
           : ohlcv.lows[ohlcv.lows.length - 1])
       : undefined;
 
-    if (shouldExit(t, priceWad, cfg, liveAtrPct, true, candleExtreme)) {
+    // ── Trailing-stop minimum hold time ─────────────────────────────────────
+    // Prevent the profit-reversal trailing stop from triggering in the first
+    // 60 seconds after entry.  On volatile 5m candles a +0.5% tick followed by
+    // a pullback to entry would otherwise promote bestPriceWad to the gate level
+    // (5–10% lev) and immediately exit at 0% PnL.
+    // The hard stop-loss (rawMove ≤ -stop) is still allowed to fire at any age —
+    // those protect against sudden crashes where waiting 60s is dangerous.
+    const trailHeldMs   = Date.now() - t.openedAtMs;
+    const MIN_TRAIL_MS  = 60_000; // 60 seconds
+    const trailReady    = trailHeldMs >= MIN_TRAIL_MS;
+
+    // Always advance bestPriceWad from kline data (needed for later ticks), but
+    // only call shouldExit for the trailing-stop gate once the hold time has passed.
+    // Hard stop (rawMove ≤ -stop) is checked separately and fires immediately.
+    const rawMoveCheck  = movePctWad(t, priceWad);
+    const rawStopImm    = t.leverage >= 40
+      ? Math.max(0.005, Math.min(0.008, 0.30 / t.leverage))
+      : cfg.STOP_LOSS_PCT;
+    const hardStopNow   = rawMoveCheck <= -toWad(rawStopImm);
+
+    // Advance bestPriceWad unconditionally so the trailing level builds up correctly
+    // for when the 60-second window expires.
+    if (!trailReady) updateBest(t, candleExtreme ?? priceWad);
+
+    if (hardStopNow || (trailReady && shouldExit(t, priceWad, cfg, liveAtrPct, true, candleExtreme))) {
       t.closing = true; // guard: prevents fast-exit monitor from double-closing
       emit(deps, { type: "EXIT_SIGNAL", userKey, symbol, timeframe, reason: "risk_exit" });
 
