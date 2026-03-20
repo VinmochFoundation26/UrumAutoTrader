@@ -55,7 +55,7 @@ export const DEFAULT_CFG: BotConfig = {
   STOP_LOSS_PCT: 0.01,         // Tier 1 (10×–30×): 1% raw stop → 30% lev loss, safe before liquidation @ 30×
                                // Tier 2 (40×–100×): overridden dynamically to 0.5–0.8% ATR-scaled (see shouldExit)
   EXIT_ON_PROFIT_REVERSAL: 0.03,    // trail gap   — 3% give-back from peak (tight, preserves big-runner gains)
-  MIN_PROFIT_BEFORE_REVERSAL: 0.05, // gate/floor  — trail activates only once peak ≥ 5% leveraged;
+  MIN_PROFIT_BEFORE_REVERSAL: 0.03, // gate/floor  — trail activates once peak ≥ 3% leveraged;
                                     //               also the minimum exit level (floor)
   DEFAULT_LEVERAGE: 10,
   MAX_LEVERAGE: 100,           // raised; symbol cap enforced separately
@@ -817,7 +817,7 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   // ── 2. Profit-reversal trailing stop (LEVERAGED PnL terms) ─────────────────
   // Two decoupled knobs (both in leveraged PnL %):
   //
-  //   GATE  = MIN_PROFIT_BEFORE_REVERSAL (0.05 = 5%)
+  //   GATE  = MIN_PROFIT_BEFORE_REVERSAL (0.03 = 3%)
   //     — The peak must reach this level before the trailing stop activates.
   //     — Also serves as the exit floor: we never exit below it once triggered.
   //     — Trades that never reach the gate continue running until stop-loss.
@@ -828,14 +828,14 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   //
   //   effectiveStop = max(gate, peak − trail)
   //
-  // Behaviour table (GATE=5%, TRAIL=3%, at 10× leverage):
-  //   peak =  3%  → gate not reached → hold (trade continues)
-  //   peak =  4%  → gate not reached → hold (trade continues)
-  //   peak =  5%  → gate hit; trail=2%; effectiveStop = max(5%, 2%) = 5%  ← floor
-  //   peak =  8%  → effectiveStop = max(5%, 5%) = 5%                      ← floor
-  //   peak = 10%  → effectiveStop = max(5%, 7%) = 7%                      ← trail
-  //   peak = 20%  → effectiveStop = max(5%, 17%) = 17%                    ← trail (unchanged vs old)
-  //   peak = 46%  → effectiveStop = max(5%, 43%) = 43%                    ← trail (unchanged vs old)
+  // Behaviour table (GATE=3%, TRAIL=3%, at 3× leverage):
+  //   peak =  2%  → gate not reached → hold (trade continues)
+  //   peak =  3%  → gate hit; effectiveStop = max(3%, 0%) = 3%  ← floor
+  //   peak =  5%  → effectiveStop = max(3%, 2%) = 3%            ← floor
+  //   peak =  6%  → effectiveStop = max(3%, 3%) = 3%            ← floor
+  //   peak =  7%  → effectiveStop = max(3%, 4%) = 4%            ← trail
+  //   peak = 12%  → effectiveStop = max(3%, 9%) = 9%            ← trail
+  //   peak = 20%  → effectiveStop = max(3%, 17%) = 17%          ← trail
   // ───────────────────────────────────────────────────────────────────────────
   const levWad   = toWad(t.leverage);
   const move     = mulWad(rawMove, levWad);                        // leveraged current PnL
