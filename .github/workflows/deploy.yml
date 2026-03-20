@@ -43,7 +43,7 @@ jobs:
       - name: Package all dist files
         run: |
           mkdir -p /tmp/deploy-pkg/frontend
-          cp -r backend/dist backend/package.json backend/package-lock.json /tmp/deploy-pkg/
+          cp -r backend/dist backend/package.json backend/package-lock.json backend/Dockerfile /tmp/deploy-pkg/
           cp -r frontend/dist /tmp/deploy-pkg/frontend/
           tar -czf /tmp/deploy.tar.gz -C /tmp/deploy-pkg .
 

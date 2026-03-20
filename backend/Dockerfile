@@ -1,21 +1,16 @@
 # ── AutoTrader Backend — Node 20 Alpine ──────────────────────────────────────
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY tsconfig.json ./
-COPY src ./src
-RUN npm run build
-
-# ── Production image ──────────────────────────────────────────────────────────
-FROM node:20-alpine AS runtime
+# TypeScript is compiled by CI (GitHub Actions). This image just installs
+# production deps and runs the pre-built dist/.
+FROM node:20-alpine
 RUN apk add --no-cache tini
 WORKDIR /app
 
-# Copy only built output + production deps
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY package.json ./
+# Install production dependencies from lock file (includes all packages)
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy pre-built output (shipped by CI deploy pipeline)
+COPY dist ./dist
 
 # Non-root user
 RUN addgroup -S app && adduser -S app -G app
