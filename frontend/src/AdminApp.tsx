@@ -3,7 +3,7 @@ import { useEffect, useState, useCallback } from "react";
 import {
   Activity, AlertTriangle, Bot, CheckCircle, Circle,
   Power, RefreshCw, Settings, Trash2, User, Users,
-  Wallet, X, Zap, MessageCircle, Shield, DollarSign, CreditCard,
+  Wallet, X, Zap, MessageCircle, Shield, DollarSign, CreditCard, Sliders,
 } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -47,6 +47,14 @@ interface UserFeeStats {
   subscription: { paidUntil: string | null; totalPaid: number; active: boolean; status: "trial" | "active" | "expired"; daysLeft: number };
   recentTransactions: { type: string; amount: number; fee: number; net: number; ts: string }[];
   feeRates: { depositPct: number; withdrawPct: number; emergencyPct: number; profitSharePct: number; subscriptionUSDC: number; trialDays: number };
+}
+
+interface UserTradingConfig {
+  symbols?:             string[];
+  maxLeverage?:         number;
+  maxConcurrentTrades?: number;
+  riskPct?:             number;
+  updatedAt?:           string;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -118,6 +126,244 @@ function StatusBadge({ status }: { status: UserStatus }) {
     <span style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, background: `${color}22`, color, border: `1px solid ${color}44` }}>
       {label}
     </span>
+  );
+}
+
+// ── Trading Config Editor ─────────────────────────────────────────────────────
+
+const KNOWN_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","TAOUSDT","RENDERUSDT"];
+
+function TradingConfigEditor({ user, onClose, onSaved }: {
+  user: AppUser;
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [cfg,     setCfg]     = useState<UserTradingConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(false);
+  const [err,     setErr]     = useState<string | null>(null);
+
+  // Form state
+  const [symbols,     setSymbols]     = useState<string[]>([]);
+  const [maxLev,      setMaxLev]      = useState<string>("");
+  const [maxConc,     setMaxConc]     = useState<string>("");
+  const [riskPct,     setRiskPct]     = useState<string>("");
+
+  useEffect(() => {
+    api<any>(`/admin/users/${user.id}/trading-config`).then(r => {
+      const c: UserTradingConfig = r.config ?? {};
+      setCfg(c);
+      setSymbols(c.symbols ?? []);
+      setMaxLev(c.maxLeverage != null ? String(c.maxLeverage) : "");
+      setMaxConc(c.maxConcurrentTrades != null ? String(c.maxConcurrentTrades) : "");
+      setRiskPct(c.riskPct != null ? String(+(c.riskPct * 100).toFixed(1)) : "");
+    }).catch(() => setErr("Failed to load config"))
+    .finally(() => setLoading(false));
+  }, [user.id]);
+
+  function toggleSymbol(sym: string) {
+    setSymbols(prev => prev.includes(sym) ? prev.filter(s => s !== sym) : [...prev, sym]);
+  }
+
+  async function handleSave() {
+    setSaving(true); setErr(null);
+    const patch: UserTradingConfig = {};
+    if (symbols.length > 0) patch.symbols = symbols;
+    if (maxLev)  patch.maxLeverage         = Number(maxLev);
+    if (maxConc) patch.maxConcurrentTrades = Number(maxConc);
+    if (riskPct) patch.riskPct             = Number(riskPct) / 100;
+    try {
+      const r = await api<any>(`/admin/users/${user.id}/trading-config`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(r.error ?? "Save failed");
+      onSaved(`Trading config saved for ${user.email}`);
+      onClose();
+    } catch (e: any) {
+      setErr(e?.message ?? "Save failed");
+    } finally { setSaving(false); }
+  }
+
+  async function handleReset() {
+    if (!confirm("Reset to global defaults? This removes all per-user overrides.")) return;
+    setSaving(true);
+    try {
+      const r = await api<any>(`/admin/users/${user.id}/trading-config`, { method: "DELETE" });
+      if (!r.ok) throw new Error(r.error ?? "Reset failed");
+      onSaved(`Trading config reset for ${user.email}`);
+      onClose();
+    } catch (e: any) {
+      setErr(e?.message ?? "Reset failed");
+    } finally { setSaving(false); }
+  }
+
+  const row = (label: string, input: React.ReactNode, hint?: string) => (
+    <div style={{ marginBottom: 16 }}>
+      <label style={{ fontSize: 12, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>{label}</label>
+      {input}
+      {hint && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>{hint}</div>}
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, padding: 16 }}>
+      <div style={{ background: "#1a1d23", border: "1px solid #2a2d35", borderRadius: 14, padding: 28, width: 480, maxWidth: "100%", maxHeight: "90vh", overflow: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div>
+            <h3 style={{ margin: 0, color: "var(--teal)" }}>Trading Config</h3>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 3 }}>{user.email}</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#888", cursor: "pointer" }}><X size={18} /></button>
+        </div>
+
+        {loading ? (
+          <div style={{ textAlign: "center", padding: 30, color: "var(--text-secondary)" }}><RefreshCw size={20} className="spin" /></div>
+        ) : (
+          <>
+            {cfg?.updatedAt && (
+              <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 16 }}>
+                Last updated: {fmtDate(cfg.updatedAt)} — empty fields inherit global defaults
+              </div>
+            )}
+
+            {row("Symbols (leave none selected = use global defaults)",
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {KNOWN_SYMBOLS.map(sym => (
+                  <button
+                    key={sym}
+                    onClick={() => toggleSymbol(sym)}
+                    style={{
+                      padding: "5px 10px", borderRadius: 6, fontSize: 12, cursor: "pointer", fontWeight: 500,
+                      background: symbols.includes(sym) ? "rgba(0,212,170,0.15)" : "var(--surface)",
+                      color:      symbols.includes(sym) ? "var(--teal)" : "var(--text-secondary)",
+                      border: `1px solid ${symbols.includes(sym) ? "var(--teal)" : "var(--border)"}`,
+                    }}
+                  >{sym.replace("USDT","")}</button>
+                ))}
+              </div>
+            )}
+
+            {row("Max Leverage",
+              <input
+                type="number" min={1} max={20} step={1}
+                placeholder="e.g. 5 (global default applies if blank)"
+                value={maxLev}
+                onChange={e => setMaxLev(e.target.value)}
+                style={{ width: "100%", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", color: "var(--text)", fontSize: 14 }}
+              />,
+              "Hard cap — user cannot exceed this leverage regardless of global config"
+            )}
+
+            {row("Max Concurrent Trades",
+              <input
+                type="number" min={1} max={10} step={1}
+                placeholder="e.g. 2 (global default applies if blank)"
+                value={maxConc}
+                onChange={e => setMaxConc(e.target.value)}
+                style={{ width: "100%", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", color: "var(--text)", fontSize: 14 }}
+              />,
+              "Maximum simultaneous open positions for this user"
+            )}
+
+            {row("Risk Per Trade (%)",
+              <input
+                type="number" min={1} max={100} step={0.5}
+                placeholder="e.g. 10 = 10% of vault per trade"
+                value={riskPct}
+                onChange={e => setRiskPct(e.target.value)}
+                style={{ width: "100%", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", color: "var(--text)", fontSize: 14 }}
+              />,
+              "Percentage of vault balance allocated per trade"
+            )}
+
+            {err && <div style={{ color: "#EF4444", fontSize: 13, marginBottom: 12 }}>⚠ {err}</div>}
+
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button
+                onClick={handleReset}
+                disabled={saving}
+                style={{ padding: "9px 14px", background: "transparent", border: "1px solid #EF444444", borderRadius: 8, color: "#EF4444", cursor: "pointer", fontSize: 13 }}
+              >
+                Reset to Defaults
+              </button>
+              <div style={{ flex: 1 }} />
+              <button onClick={onClose} style={{ padding: "9px 14px", background: "transparent", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text-secondary)", cursor: "pointer", fontSize: 13 }}>
+                Cancel
+              </button>
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                style={{ padding: "9px 18px", background: "var(--teal)", border: "none", borderRadius: 8, color: "#000", cursor: "pointer", fontSize: 13, fontWeight: 700, opacity: saving ? 0.6 : 1 }}
+              >
+                {saving ? "Saving…" : "Save Config"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Grant Subscription Modal ──────────────────────────────────────────────────
+
+function GrantSubModal({ user, onClose, onGranted }: {
+  user: AppUser;
+  onClose: () => void;
+  onGranted: (msg: string) => void;
+}) {
+  const [amount,  setAmount]  = useState("20");
+  const [loading, setLoading] = useState(false);
+  const [err,     setErr]     = useState<string | null>(null);
+
+  async function handleGrant() {
+    setLoading(true); setErr(null);
+    try {
+      // POST /subscription/pay on behalf of user using admin endpoint
+      const r = await api<any>(`/admin/users/${user.id}/grant-subscription`, {
+        method: "POST",
+        body: JSON.stringify({ amount: Number(amount) }),
+      });
+      if (!r.ok) throw new Error(r.error ?? "Grant failed");
+      onGranted(`Subscription granted for ${user.email} until ${r.paidUntil?.slice(0,10)}`);
+      onClose();
+    } catch (e: any) {
+      setErr(e?.message ?? "Grant failed");
+    } finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, padding: 16 }}>
+      <div style={{ background: "#1a1d23", border: "1px solid #2a2d35", borderRadius: 12, padding: 28, width: 380, maxWidth: "100%" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ margin: 0, color: "var(--teal)" }}>Grant Subscription</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "#888", cursor: "pointer" }}><X size={18} /></button>
+        </div>
+        <p style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 16, lineHeight: 1.6 }}>
+          Manually grant a 30-day subscription period to <strong style={{ color: "var(--text)" }}>{user.email}</strong>.<br />
+          Use this for refunds, compensation, or manual payments received off-platform.
+        </p>
+        <label style={{ fontSize: 12, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>Amount (USDC)</label>
+        <input
+          type="number" min={0} step={1}
+          value={amount}
+          onChange={e => setAmount(e.target.value)}
+          style={{ width: "100%", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px", color: "var(--text)", fontSize: 14, marginBottom: 16, boxSizing: "border-box" }}
+        />
+        {err && <div style={{ color: "#EF4444", fontSize: 13, marginBottom: 12 }}>⚠ {err}</div>}
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onClose} style={{ flex: 1, padding: 10, background: "transparent", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text-secondary)", cursor: "pointer" }}>Cancel</button>
+          <button
+            onClick={handleGrant}
+            disabled={loading}
+            style={{ flex: 1, padding: 10, background: "var(--teal)", border: "none", borderRadius: 8, color: "#000", cursor: "pointer", fontWeight: 700, opacity: loading ? 0.6 : 1 }}
+          >
+            {loading ? "Granting…" : "Grant 30 Days"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -218,14 +464,16 @@ function ApproveModal({ user, onApprove, onClose }: { user: AppUser; onApprove: 
 
 export default function AdminApp() {
   const [token,    setToken]    = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
-  const [tab,      setTab]      = useState<"approvals" | "users" | "tickets" | "stats" | "fees">("approvals");
+  const [tab,      setTab]      = useState<"approvals" | "users" | "tickets" | "stats" | "fees" | "config">("approvals");
   const [users,    setUsers]    = useState<AppUser[]>([]);
   const [stats,    setStats]    = useState<AdminStats | null>(null);
   const [tickets,  setTickets]  = useState<SupportTicket[]>([]);
   const [feeStats, setFeeStats] = useState<Record<string, UserFeeStats>>({});
   const [loading,  setLoading]  = useState(false);
   const [msg,      setMsg]      = useState<string | null>(null);
-  const [approveTarget, setApproveTarget] = useState<AppUser | null>(null);
+  const [approveTarget,  setApproveTarget]  = useState<AppUser | null>(null);
+  const [configTarget,   setConfigTarget]   = useState<AppUser | null>(null);
+  const [grantSubTarget, setGrantSubTarget] = useState<AppUser | null>(null);
 
   // Check token is admin role
   useEffect(() => {
@@ -347,6 +595,22 @@ export default function AdminApp() {
         />
       )}
 
+      {configTarget && (
+        <TradingConfigEditor
+          user={configTarget}
+          onClose={() => setConfigTarget(null)}
+          onSaved={m => { flash(m); fetchAll(); }}
+        />
+      )}
+
+      {grantSubTarget && (
+        <GrantSubModal
+          user={grantSubTarget}
+          onClose={() => setGrantSubTarget(null)}
+          onGranted={m => { flash(m); fetchAll(); }}
+        />
+      )}
+
       <main className="dashboard-layout" style={{ padding: "80px 20px 20px" }}>
         {/* ── Stats strip ── */}
         {stats && (
@@ -374,6 +638,7 @@ export default function AdminApp() {
           {([
             { key: "approvals", label: `Approvals${pendingUsers.length ? ` (${pendingUsers.length})` : ""}`, icon: <CheckCircle size={14} /> },
             { key: "users",     label: "All Users",   icon: <Users size={14} /> },
+            { key: "config",    label: "Trading Config", icon: <Sliders size={14} /> },
             { key: "tickets",   label: `Tickets${tickets.length ? ` (${tickets.length})` : ""}`, icon: <MessageCircle size={14} /> },
             { key: "fees",      label: "Fees & Subs", icon: <DollarSign size={14} /> },
             { key: "stats",     label: "Bot Stats",   icon: <Settings size={14} /> },
@@ -478,6 +743,7 @@ export default function AdminApp() {
                           {u.status === "suspended" && (
                             <button onClick={() => setApproveTarget(u)} className="icon-btn" title="Re-approve" style={{ color: "#00D4AA" }}><CheckCircle size={14} /></button>
                           )}
+                          <button onClick={() => setConfigTarget(u)} className="icon-btn" title="Edit trading config" style={{ color: "#818CF8" }}><Sliders size={14} /></button>
                           <button onClick={() => deleteUser(u.id)} className="icon-btn" title="Delete" style={{ color: "#EF4444" }}><Trash2 size={14} /></button>
                         </div>
                       </td>
@@ -490,6 +756,51 @@ export default function AdminApp() {
                   )}
                 </tbody>
               </table>
+            </div>
+          </div>
+        )}
+
+        {/* ── TRADING CONFIG ── */}
+        {tab === "config" && (
+          <div>
+            <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 6, color: "var(--text-primary)" }}>Per-User Trading Config</h2>
+            <p style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 20 }}>
+              Override symbols, leverage, concurrent trades, and risk % per user. Blank fields inherit global <code>bot.config.json</code> values.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {users.filter(u => u.status === "active" || u.status === "suspended").map(u => (
+                <div key={u.id} style={{ background: "var(--card-bg)", border: "1px solid var(--border)", borderRadius: 12, padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+                  <div>
+                    <div style={{ fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>
+                      <User size={13} style={{ verticalAlign: "middle", marginRight: 6, color: "var(--teal)" }} />{u.email}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                      <StatusBadge status={u.status} />
+                      <span style={{ marginLeft: 8 }}>Wallet: {u.walletAddress ? `${u.walletAddress.slice(0,8)}…` : "none"}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => setGrantSubTarget(u)}
+                      style={{ padding: "7px 12px", background: "rgba(0,212,170,0.1)", border: "1px solid rgba(0,212,170,0.3)", borderRadius: 7, color: "var(--teal)", cursor: "pointer", fontSize: 12, fontWeight: 500 }}
+                    >
+                      <CreditCard size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />Grant Sub
+                    </button>
+                    <button
+                      onClick={() => setConfigTarget(u)}
+                      style={{ padding: "7px 12px", background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.3)", borderRadius: 7, color: "#818CF8", cursor: "pointer", fontSize: 12, fontWeight: 500 }}
+                    >
+                      <Sliders size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />Edit Config
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {users.filter(u => u.status === "active" || u.status === "suspended").length === 0 && (
+                <div style={{ textAlign: "center", padding: 40, color: "var(--text-secondary)" }}>
+                  <Sliders size={32} style={{ opacity: 0.3, marginBottom: 8 }} />
+                  <p>No active users yet</p>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -570,9 +881,13 @@ export default function AdminApp() {
                           </div>
                           <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>{u.role} · <StatusBadge status={u.status} /></div>
                         </div>
-                        {sub && (
-                          <SubBadge status={sub.status} daysLeft={sub.daysLeft} />
-                        )}
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          {sub && <SubBadge status={sub.status} daysLeft={sub.daysLeft} />}
+                          <button
+                            onClick={() => setGrantSubTarget(u)}
+                            style={{ padding: "4px 10px", background: "rgba(0,212,170,0.1)", border: "1px solid rgba(0,212,170,0.3)", borderRadius: 6, color: "var(--teal)", cursor: "pointer", fontSize: 11 }}
+                          >+ Grant Sub</button>
+                        </div>
                       </div>
                       {fs ? (
                         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>

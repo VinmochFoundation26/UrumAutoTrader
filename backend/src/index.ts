@@ -558,6 +558,23 @@ http
         return json(res, 200, { ok: true, message: "Trading config reset to global defaults" });
       }
 
+      // ── POST /admin/users/:id/grant-subscription — admin grants sub manually ─
+      if (/^\/admin\/users\/[^/]+\/grant-subscription$/.test(u.pathname) && req.method === "POST") {
+        const auth = await requireAdminRole(req);
+        if ("error" in auth) return json(res, auth.error === "forbidden" ? 403 : 401, { ok: false, error: auth.error });
+        const userId = u.pathname.split("/")[3];
+        try {
+          const b      = await readJson(req);
+          const amount = parseFloat(b.amount ?? FEE.SUBSCRIPTION_USDC);
+          const { paidUntil } = await recordSubscriptionPayment(getRedis(), userId, amount);
+          await auditLog(auth.userId, "grant_subscription", userId, `amount=${amount} paidUntil=${paidUntil}`);
+          log.info({ adminId: auth.userId, userId, amount, paidUntil }, "[admin] subscription granted");
+          return json(res, 200, { ok: true, paidUntil, amount, message: `Subscription granted until ${paidUntil}` });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
       // ── GET /admin/stats ────────────────────────────────────────────────────
       if (u.pathname === "/admin/stats" && req.method === "GET") {
         const auth = await requireAdminRole(req);
