@@ -368,6 +368,11 @@ function EventRow({ e }: { e: BotEvent }) {
       )}
       {isVotes && e.votes && (
         <span className="event-votes">
+          {e.timeframe && (
+            <span style={{ opacity: 0.55, fontSize: "0.75em", marginRight: "3px" }}>
+              [{e.timeframe}]
+            </span>
+          )}
           L:{e.votes.longVotes} S:{e.votes.shortVotes} req:{e.votes.required}
           {e.votes.trendRegime && e.votes.trendRegime !== "NONE" && (
             <span className={`event-side ${e.votes.trendRegime === "LONG" ? "side-long" : "side-short"}`}>

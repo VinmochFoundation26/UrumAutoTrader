@@ -875,6 +875,23 @@ export async function fastExitCheck(
   // Use cached config (10s TTL) to avoid hammering Redis on every 500ms tick
   const cfg = deps.redis ? await loadUserConfigCached(deps.redis, userKey) : DEFAULT_CFG;
 
+  // ── Minimum hold time guard (fast monitor) ─────────────────────────────────
+  // Mirror the 60-second hold window used by the 10s kline scanner.
+  // The fast monitor must not fire the trailing stop before 60s either;
+  // the scanner advances bestPriceWad during the hold window, which would
+  // let the fast monitor trigger exits at 0% PnL on any brief price dip.
+  // Hard stop-loss (rawMove ≤ -stop) is still allowed to fire immediately.
+  const fastHeldMs  = Date.now() - t.openedAtMs;
+  const MIN_HOLD_MS = 60_000;
+  if (fastHeldMs < MIN_HOLD_MS) {
+    // Only allow an immediate hard stop; skip the trailing-stop check entirely.
+    const rawMoveF  = movePctWad(t, priceWad);
+    const rawStopF  = t.leverage >= 40
+      ? Math.max(0.005, Math.min(0.008, 0.30 / t.leverage))
+      : cfg.STOP_LOSS_PCT;
+    if (rawMoveF > -toWad(rawStopF)) return; // not at hard stop — keep holding
+  }
+
   // advanceBestPrice=false: do NOT update bestPriceWad from raw WS tick prices.
   // WS prices include micro-spikes that reverse within < 500ms; locking bestPriceWad
   // to a spike would cause exits far below the gate on the very next tick.
@@ -1452,9 +1469,11 @@ export async function evaluateUserSymbol(
       : cfg.STOP_LOSS_PCT;
     const hardStopNow   = rawMoveCheck <= -toWad(rawStopImm);
 
-    // Advance bestPriceWad unconditionally so the trailing level builds up correctly
-    // for when the 60-second window expires.
-    if (!trailReady) updateBest(t, candleExtreme ?? priceWad);
+    // Do NOT advance bestPriceWad during the hold window.
+    // Advancing it would pre-arm the trailing-stop gate so the fast monitor
+    // (50ms) could trigger an exit at 0% PnL on any brief dip below the gate.
+    // After the 60s window opens, shouldExit() advances bestPriceWad normally
+    // (advanceBestPrice=true), building up the trailing level from scratch.
 
     if (hardStopNow || (trailReady && shouldExit(t, priceWad, cfg, liveAtrPct, true, candleExtreme))) {
       t.closing = true; // guard: prevents fast-exit monitor from double-closing
