@@ -45,7 +45,7 @@ import { startEngine, stopEngine } from "./services/bot/runner.js";
 import { getState, setRunning, recordError, addSseClient, getEventHistory } from "./services/bot/state.js";
 import { getVaultBalances } from "./services/onchain/vaultViews.js";
 import { validateConfig, CFG_KEYS, symbolMaxLev } from "./botWorker.trend_range_fork.js";
-import { closePositionVaultV2, depositStableToVault, withdrawStableFromVault, emergencyWithdrawFromVault, getWalletStableBalance, transferUsdcFee } from "./services/onchain/vaultAdapter.js";
+import { closePositionVaultV2, depositStableToVault, withdrawStableFromVault, emergencyWithdrawFromVault, getWalletStableBalance, transferUsdcFee, waitWithFallback } from "./services/onchain/vaultAdapter.js";
 import { getSigner, getVaultWriteContract, getProvider, getVaultAddress } from "./services/onchain/contractInstance.js";
 import { recordDeposit, recordWithdrawal, recordSubscriptionPayment, checkSubscription, getUserFeeStats, FEE } from "./services/fees/feeEngine.js";
 import { workerPool } from "./services/bot/workerPool.js";
@@ -1166,6 +1166,7 @@ http
             ok: true,
             user,
             stableToken: stableAddr,
+            vaultAddress: getVaultAddress(),
             wallet:    { raw: wallet.raw, formatted: wallet.formatted, decimals: STABLE_DECIMALS },
             vault:     { wad: stableX18.toString(), formatted: fmtX18(stableX18) },
             pending:   { wad: pendingX18.toString(), formatted: fmtX18(pendingX18) },
@@ -1324,6 +1325,74 @@ http
         } catch (e: any) {
           log.error({ err: e?.message }, "[vault] withdraw failed");
           return json(res, 500, { ok: false, error: e?.reason ?? e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /vault/approve-withdraw — Step 2 of normal withdrawal ──────────
+      // Called by frontend AFTER user has already called initiateWithdrawStable()
+      // via MetaMask (Step 1). Bot signer completes the approval.
+      if (u.pathname === "/vault/approve-withdraw" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload  = decodeToken(req);
+          const userId   = payload?.userId ?? "legacy";
+          const b        = await readJson(req);
+          const netAmountRaw = BigInt(b.netAmountRaw); // net after platform fee, as string
+          const grossAmount  = parseFloat(b.grossAmount);
+          const mode         = (b.mode ?? "normal") as "normal" | "emergency";
+          const user         = currentUserAddress;
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
+
+          const signer  = getSigner();
+          const writeC  = getVaultWriteContract();
+          const readC   = getVaultReadContract();
+          const stableX18: bigint = await readC.stableBalanceX18(user);
+          const vaultBalanceUsdc  = +(Number(stableX18) / 1e18).toFixed(6);
+
+          // Record platform fee
+          const fees = await recordWithdrawal(getRedis(), userId, grossAmount, vaultBalanceUsdc, mode, undefined);
+
+          // Bot approves the withdrawal — sends net USDC to user
+          const approveTx = await (writeC.connect(signer) as any).approveWithdrawStable(user, netAmountRaw);
+          const receipt   = await waitWithFallback(approveTx);
+          const feeBps: bigint = await readC.withdrawFeeBps();
+          const contractNetReceived = +(Number(netAmountRaw) / 1e6 * Number(10_000n - feeBps) / 10_000).toFixed(2);
+
+          await recordWithdrawal(getRedis(), userId, 0, vaultBalanceUsdc, mode, receipt.hash).catch(() => {});
+          log.info({ txHash: receipt.hash, contractNetReceived, platformFees: fees }, "[vault] approve-withdraw confirmed");
+          return json(res, 200, {
+            ok: true, txHash: receipt.hash, type: "normal",
+            amount: grossAmount,
+            platformWithdrawFee: fees.withdrawFee,
+            profitShare: fees.profitShare,
+            totalPlatformFee: fees.totalFee,
+            netReceived: contractNetReceived,
+          });
+        } catch (e: any) {
+          log.error({ err: e?.message }, "[vault] approve-withdraw failed");
+          return json(res, 500, { ok: false, error: e?.reason ?? e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /vault/record-emergency-withdraw — record emergency fee after user TX ─
+      if (u.pathname === "/vault/record-emergency-withdraw" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload = decodeToken(req);
+          const userId  = payload?.userId ?? "legacy";
+          const b       = await readJson(req);
+          const grossAmount = parseFloat(b.grossAmount);
+          const txHash      = b.txHash as string;
+          const readC       = getVaultReadContract();
+          const user        = currentUserAddress;
+          const stableX18: bigint = await readC.stableBalanceX18(user ?? "");
+          const vaultBalanceUsdc   = +(Number(stableX18) / 1e18).toFixed(6);
+          const fees = await recordWithdrawal(getRedis(), userId, grossAmount, vaultBalanceUsdc, "emergency", txHash);
+          return json(res, 200, { ok: true, txHash, fees });
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
       }
 

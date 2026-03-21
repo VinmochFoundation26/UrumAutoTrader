@@ -59,7 +59,7 @@ const GAS_BUMP_FACTOR  = 1.15;      // 15% gas bump for replacement TX
  * @param onStuck   Optional callback that resends with bumped gas; returns the
  *                  replacement TransactionResponse (or null to give up).
  */
-async function waitWithFallback(
+export async function waitWithFallback(
   tx:       TransactionResponse,
   retries:  number = 3,
   onStuck?: () => Promise<TransactionResponse | null>,

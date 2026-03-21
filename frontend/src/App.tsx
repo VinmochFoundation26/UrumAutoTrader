@@ -29,7 +29,8 @@ interface VaultBalance {
 }
 
 interface WalletData {
-  stableToken: string;
+  stableToken:  string;
+  vaultAddress: string;
   wallet:    { raw: string; formatted: number; decimals: number };
   vault:     { wad: string; formatted: number };
   pending:   { wad: string; formatted: number };
@@ -1089,23 +1090,67 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
   }
 
   async function handleWithdraw(all?: boolean) {
-    if (!all) {
-      const amt = parseFloat(amount);
-      if (!amt || amt <= 0) { setErr("Enter an amount to withdraw"); return; }
-      if (amt > maxWithdraw) { setErr(`Insufficient vault balance ($${maxWithdraw.toFixed(2)} available)`); return; }
-    }
+    const grossAmt = all ? maxWithdraw : parseFloat(amount);
+    if (!grossAmt || grossAmt <= 0) { setErr("Enter an amount to withdraw"); return; }
+    if (grossAmt > maxWithdraw) { setErr(`Insufficient vault balance ($${maxWithdraw.toFixed(2)} available)`); return; }
+
+    const eth = (window as any).ethereum;
+    if (!eth) { setErr("No wallet connected — open this page inside MetaMask browser"); return; }
+
     setLoading(true); resetFeedback();
     try {
-      const body = all
-        ? { all: true, emergency: withdrawMode === "emergency" }
-        : { amount: parseFloat(amount), emergency: withdrawMode === "emergency" };
-      const r: any = await apiFetch("/vault/withdraw", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+      const DECIMALS = walletData?.wallet.decimals ?? 6;
+      const feePct   = withdrawMode === "normal" ? (fees?.withdrawPct ?? 10) : (fees?.emergencyPct ?? 15);
+      const netAmt   = +(grossAmt * (1 - feePct / 100)).toFixed(6);
+      const netRaw    = BigInt(Math.round(netAmt * 10 ** DECIMALS));
+      const vaultAddr = walletData!.vaultAddress;
+
+      // ABI-encode: functionSelector(4 bytes) + uint256(32 bytes)
+      function encodeCall(selector: string, amount: bigint): string {
+        return selector + amount.toString(16).padStart(64, "0");
+      }
+
+      // Step 1: User signs the withdrawal initiation via MetaMask
+      // initiateWithdrawStable(uint256) selector = 0x754da337
+      // emergencyWithdrawStable(uint256) selector = 0x3ccfd60b
+      const selector = withdrawMode === "emergency" ? "0x3ccfd60b" : "0x754da337";
+      const callAmount = withdrawMode === "emergency" ? netRaw : netRaw; // both use net (fee stays in vault)
+
+      const initTxHash: string = await eth.request({
+        method: "eth_sendTransaction",
+        params: [{ from: (await eth.request({ method: "eth_accounts" }))[0], to: vaultAddr, data: encodeCall(selector, callAmount) }],
       });
-      if (!r.ok) throw new Error(r.error ?? "Withdraw failed");
-      setResult({ txHash: r.txHash, net: r.netReceived ?? 0, fee: r.totalPlatformFee != null ? `$${Number(r.totalPlatformFee).toFixed(2)}` : "?" });
+
+      // Wait for MetaMask TX to be mined
+      setResult({ txHash: initTxHash, net: 0, fee: "pending…" });
+      let mined = false;
+      for (let i = 0; i < 60 && !mined; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const receipt: any = await eth.request({ method: "eth_getTransactionReceipt", params: [initTxHash] });
+        if (receipt?.status === "0x1") mined = true;
+        if (receipt?.status === "0x0") throw new Error("Transaction reverted on-chain");
+      }
+      if (!mined) throw new Error("Transaction not confirmed after 3 minutes");
+
+      if (withdrawMode === "emergency") {
+        // Emergency: user TX is self-contained — just record fees on backend
+        const r: any = await apiFetch("/vault/record-emergency-withdraw", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ grossAmount: grossAmt, txHash: initTxHash }),
+        });
+        setResult({ txHash: initTxHash, net: +(netAmt * 0.85).toFixed(2), fee: r.fees?.totalFee != null ? `$${Number(r.fees.totalFee).toFixed(2)}` : "?" });
+      } else {
+        // Normal: backend bot signer calls approveWithdrawStable
+        const r: any = await apiFetch("/vault/approve-withdraw", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ netAmountRaw: netRaw.toString(), grossAmount: grossAmt, mode: "normal" }),
+        });
+        if (!r.ok) throw new Error(r.error ?? "Approval failed");
+        setResult({ txHash: r.txHash, net: r.netReceived ?? netAmt, fee: r.totalPlatformFee != null ? `$${Number(r.totalPlatformFee).toFixed(2)}` : "?" });
+      }
+
       setAmount("");
       onRefresh();
     } catch (e: any) {
