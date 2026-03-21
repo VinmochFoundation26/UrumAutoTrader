@@ -296,6 +296,38 @@ export async function startEngine(args: {
     });
   }
 
+  // ── Sync bot.config.json → Redis global config ────────────────────────────
+  // bot.config.json is the source of truth for trading parameters.
+  // On every startup we write its values to the Redis "botcfg:global" key so
+  // that loadUserConfig() picks them up as the base layer. User-level overrides
+  // (set via admin Config panel) sit on top and are preserved.
+  // This ensures changes to bot.config.json take effect immediately on restart
+  // without needing manual Redis edits.
+  if (deps.redis) {
+    try {
+      const { CFG_KEYS } = await import("../../botWorker.trend_range_fork.js");
+      // Extract only the trading-parameter keys from cfg (skip TIMEFRAMES etc.)
+      const tradingKeys = [
+        "STOP_LOSS_PCT", "EXIT_ON_PROFIT_REVERSAL", "MIN_PROFIT_BEFORE_REVERSAL",
+        "DEFAULT_LEVERAGE", "MAX_LEVERAGE", "COOLDOWN_SECONDS", "VOTE_REQUIRED",
+        "ATR_PERIOD", "ATR_VOLATILITY_THRESHOLD", "MANUAL_SIZE_PCT",
+      ] as const;
+      const fileBase: Record<string, unknown> = {};
+      for (const k of tradingKeys) {
+        if ((cfg as any)[k] !== undefined) fileBase[k] = (cfg as any)[k];
+      }
+      if (Object.keys(fileBase).length > 0) {
+        // Merge file values under existing Redis global (file wins only for keys present in file)
+        const existing = await deps.redis.get(CFG_KEYS.global).then((s: string | null) => s ? JSON.parse(s) : {}).catch(() => ({}));
+        const merged = { ...existing, ...fileBase };
+        await deps.redis.set(CFG_KEYS.global, JSON.stringify(merged));
+        log.info({ keys: Object.keys(fileBase) }, "[runner] bot.config.json synced to Redis global config");
+      }
+    } catch (e: any) {
+      log.warn({ err: e?.message }, "[runner] bot.config.json → Redis sync failed (non-fatal)");
+    }
+  }
+
   // ── Phase 1 (Execution Hardening): TX Reconciliation ──────────────────────
   // On restart, check any transactions that were in-flight when the bot last
   // crashed. Clears Redis pendingTx keys for confirmed/reverted txs.

@@ -2259,7 +2259,17 @@ export default function App() {
         const ev: BotEvent = JSON.parse(e.data);
         setEvents(prev => {
           const next = [...prev, ev];
-          return next.length > 100 ? next.slice(-100) : next;
+          if (next.length <= 500) return next;
+          // Always preserve TRADE_EXECUTED, BEST_ENTRY, CANDIDATE_FOUND, POSITION_CLOSED
+          // so entries are never silently scrolled off by high-frequency VOTES events.
+          const critical = new Set(["TRADE_EXECUTED","BEST_ENTRY","CANDIDATE_FOUND","POSITION_CLOSED","CIRCUIT_BREAKER_TRIGGERED","POSITION_RECOVERED"]);
+          const kept: typeof next = [];
+          const routine = next.filter(x => !critical.has(x.type));
+          const important = next.filter(x => critical.has(x.type));
+          // Keep last 30 critical events + last 470 routine events = 500 total
+          kept.push(...important.slice(-30), ...routine.slice(-470));
+          kept.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+          return kept;
         });
       } catch { }
     };
@@ -2275,7 +2285,7 @@ export default function App() {
   async function handleStart() {
     setActionLoading(true);
     try {
-      // Push leverage + sizing into bot config before starting
+      // Push leverage + sizing + strategy params into bot config before starting
       await apiFetch("/bot/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2283,6 +2293,9 @@ export default function App() {
           DEFAULT_LEVERAGE: launchLeverage,
           MAX_LEVERAGE: launchLeverage,
           MANUAL_SIZE_PCT: sizeMode === "manual" ? manualSizePct / 100 : 0,
+          VOTE_REQUIRED: 5,
+          MIN_PROFIT_BEFORE_REVERSAL: 0.30,
+          EXIT_ON_PROFIT_REVERSAL: 0.03,
         }),
       });
       await apiFetch("/bot/start");
