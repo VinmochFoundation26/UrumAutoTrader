@@ -83,11 +83,12 @@ export const VAULT_ABI = [
   "event PositionClosed(address indexed user, bytes32 indexed marketId, uint256 exitPriceX18, int256 pnlX18, uint256 timestamp, address indexed executor)",
 ];
 
-/** Minimal ERC-20 ABI — used for stable token approve/balanceOf. */
+/** Minimal ERC-20 ABI — used for stable token approve/balanceOf/transfer. */
 export const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
+  "function transfer(address to, uint256 amount) returns (bool)",
   "function decimals() view returns (uint8)",
 ];
 
