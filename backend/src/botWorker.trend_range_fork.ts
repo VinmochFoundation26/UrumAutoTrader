@@ -55,12 +55,12 @@ export const DEFAULT_CFG: BotConfig = {
   STOP_LOSS_PCT: 0.01,         // Tier 1 (10×–30×): 1% raw stop → 30% lev loss, safe before liquidation @ 30×
                                // Tier 2 (40×–100×): overridden dynamically to 0.5–0.8% ATR-scaled (see shouldExit)
   EXIT_ON_PROFIT_REVERSAL: 0.03,    // trail gap   — 3% give-back from peak (tight, preserves big-runner gains)
-  MIN_PROFIT_BEFORE_REVERSAL: 0.03, // gate/floor  — trail activates once peak ≥ 3% leveraged;
+  MIN_PROFIT_BEFORE_REVERSAL: 0.30, // gate/floor  — trail activates once peak ≥ 30% leveraged (= 3% actual at 10×);
                                     //               also the minimum exit level (floor)
   DEFAULT_LEVERAGE: 10,
   MAX_LEVERAGE: 100,           // raised; symbol cap enforced separately
   COOLDOWN_SECONDS: 600,
-  VOTE_REQUIRED: 6,            // raised from 5: max votes increased to 9 (added ema20+vol bonus votes)
+  VOTE_REQUIRED: 5,            // lowered back to 5: max available votes is 9 but 5 is achievable in good setups
   ATR_PERIOD: 14,
   ATR_VOLATILITY_THRESHOLD: 0.008, // Tier 1 gate; Tier 2 uses 60% of this (≈0.48%)
                                    // Raised from 0.5% → 0.8%: RENDER/TAO normal ATR is 0.52–0.61%,
@@ -812,31 +812,29 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   // ── 2. Profit-reversal trailing stop (LEVERAGED PnL terms) ─────────────────
   // Two decoupled knobs (both in leveraged PnL %):
   //
-  //   GATE  = MIN_PROFIT_BEFORE_REVERSAL (0.03 = 3%)
+  //   GATE  = MIN_PROFIT_BEFORE_REVERSAL (0.30 = 30% leveraged = 3% actual at 10×)
   //     — The peak must reach this level before the trailing stop activates.
   //     — Also serves as the exit floor: we never exit below it once triggered.
   //     — Trades that never reach the gate continue running until stop-loss.
   //
-  //   TRAIL = EXIT_ON_PROFIT_REVERSAL    (0.03 = 3%)
+  //   TRAIL = EXIT_ON_PROFIT_REVERSAL    (0.03 = 3% leveraged = 0.3% actual at 10×)
   //     — Give-back allowed from the leveraged peak before exiting.
-  //     — Kept tight (3%) so large runners still capture most of their gains.
+  //     — Kept tight (3% lev) so large runners still capture most of their gains.
   //
   //   effectiveStop = max(gate, peak − trail)
   //
-  // Behaviour table (GATE=3%, TRAIL=3%, at 3× leverage):
-  //   peak =  2%  → gate not reached → hold (trade continues)
-  //   peak =  3%  → gate hit; effectiveStop = max(3%, 0%) = 3%  ← floor
-  //   peak =  5%  → effectiveStop = max(3%, 2%) = 3%            ← floor
-  //   peak =  6%  → effectiveStop = max(3%, 3%) = 3%            ← floor
-  //   peak =  7%  → effectiveStop = max(3%, 4%) = 4%            ← trail
-  //   peak = 12%  → effectiveStop = max(3%, 9%) = 9%            ← trail
-  //   peak = 20%  → effectiveStop = max(3%, 17%) = 17%          ← trail
+  // Behaviour table (GATE=30% lev, TRAIL=3% lev, at 10× leverage):
+  //   peak = 20% lev (2% act)  → gate not reached → hold (trade continues)
+  //   peak = 30% lev (3% act)  → gate hit; effectiveStop = max(30%, 27%) = 30%  ← floor = 3% act exit
+  //   peak = 40% lev (4% act)  → effectiveStop = max(30%, 37%) = 37%            ← trail ≈ 3.7% act
+  //   peak = 60% lev (6% act)  → effectiveStop = max(30%, 57%) = 57%            ← trail ≈ 5.7% act
+  //   peak =100% lev (10% act) → effectiveStop = max(30%, 97%) = 97%            ← trail ≈ 9.7% act
   // ───────────────────────────────────────────────────────────────────────────
   const levWad   = toWad(t.leverage);
   const move     = mulWad(rawMove, levWad);                        // leveraged current PnL
   const bestMove = mulWad(movePctWad(t, t.bestPriceWad), levWad); // leveraged peak PnL
-  const gate     = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);         // 5% — activation gate + floor
-  const trail    = toWad(cfg.EXIT_ON_PROFIT_REVERSAL);            // 3% — give-back from peak
+  const gate     = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);         // 30% lev (3% actual at 10×) — activation gate + floor
+  const trail    = toWad(cfg.EXIT_ON_PROFIT_REVERSAL);            // 3% lev (0.3% actual at 10×) — give-back from peak
 
   if (bestMove >= gate) {
     const trailLevel    = bestMove - trail;                        // e.g. 22% − 3% = 19%
@@ -1247,11 +1245,11 @@ function computeVotesFork(
       }
       const atrGuardOk = !atrExpanding;
 
-      // ── Guard 5: Asymmetric vote threshold ──────────────────────────────────
-      // SHORT requires 1 more vote than LONG.  At VOTE_REQUIRED=6 (default),
-      // LONG fires at 6 votes and SHORT fires at 7 votes.  This raises the
-      // quality bar for a SHORT without touching LONG behaviour or config.
-      const shortRequired = Math.min(required + 1, 9);
+      // ── Guard 5: Vote threshold (same as LONG) ──────────────────────────────
+      // SHORT uses same threshold as LONG (VOTE_REQUIRED = 5).
+      // The signal quality guards (EMA stack, ADX, ATR, session) already
+      // filter low-quality shorts — no need for an extra vote penalty.
+      const shortRequired = required;
 
       // ── Existing vote accumulation (unchanged) ─────────────────────────────
       shortVotes += 2;                              // direction weight (VWAP+slope regime)

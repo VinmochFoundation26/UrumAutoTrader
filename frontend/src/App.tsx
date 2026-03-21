@@ -1049,6 +1049,13 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
   const [loading, setLoading]         = useState(false);
   const [result, setResult]           = useState<{ txHash: string; net: number; fee: string } | null>(null);
   const [err, setErr]                 = useState<string | null>(null);
+  // Send-to-MetaMask state
+  const [sendAddr, setSendAddr]       = useState("");
+  const [sendAmt, setSendAmt]         = useState("");
+  const [sendLoading, setSendLoading] = useState(false);
+  const [sendResult, setSendResult]   = useState<string | null>(null);
+  const [sendErr, setSendErr]         = useState<string | null>(null);
+  const [showSend, setShowSend]       = useState(false);
 
   const maxDeposit  = walletData?.wallet.formatted    ?? 0;
   const maxWithdraw = walletData?.vault.formatted      ?? 0;
@@ -1160,6 +1167,28 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
 
   const net = previewNet();
 
+  async function handleSend() {
+    const amt = parseFloat(sendAmt);
+    const walletBal = walletData?.wallet.formatted ?? 0;
+    if (!sendAddr || !/^0x[0-9a-fA-F]{40}$/.test(sendAddr)) { setSendErr("Enter a valid 0x wallet address"); return; }
+    if (!amt || amt <= 0) { setSendErr("Enter an amount"); return; }
+    if (amt > walletBal) { setSendErr(`Insufficient wallet balance ($${walletBal.toFixed(2)} USDC available)`); return; }
+    setSendLoading(true); setSendErr(null); setSendResult(null);
+    try {
+      const r: any = await apiFetch("/vault/send-to-wallet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ toAddress: sendAddr, amount: amt }),
+      });
+      if (!r.ok) throw new Error(r.error ?? "Transfer failed");
+      setSendResult(r.txHash);
+      setSendAmt("");
+      onRefresh();
+    } catch (e: any) {
+      setSendErr(e?.message ?? "Transfer failed");
+    } finally { setSendLoading(false); }
+  }
+
   return (
     <div className="dw-panel">
       {/* Balance summary */}
@@ -1187,6 +1216,48 @@ function DepositWithdrawPanel({ walletData, onRefresh }: { walletData: WalletDat
         <button className="sym-refresh dw-refresh" onClick={onRefresh} title="Refresh balances">
           <RefreshCw size={13} />
         </button>
+      </div>
+
+      {/* Send to MetaMask */}
+      <div className="dw-send-section">
+        <button className="dw-send-toggle" onClick={() => { setShowSend(s => !s); setSendErr(null); setSendResult(null); }}>
+          📤 Send Wallet Balance to MetaMask {showSend ? "▲" : "▼"}
+        </button>
+        {showSend && (
+          <div className="dw-send-form">
+            <div className="dw-send-hint">Transfers USDC from Bot Wallet → your MetaMask address on Arbitrum One</div>
+            <input
+              className="dw-send-input"
+              placeholder="Destination address (0x...)"
+              value={sendAddr}
+              onChange={e => { setSendAddr(e.target.value); setSendErr(null); }}
+            />
+            <div className="dw-send-row">
+              <div className="dw-input-wrap" style={{ flex: 1 }}>
+                <span className="dw-input-prefix">$</span>
+                <input
+                  type="number"
+                  className="dw-input"
+                  placeholder="Amount"
+                  value={sendAmt}
+                  min={0}
+                  step="0.01"
+                  onChange={e => { setSendAmt(e.target.value); setSendErr(null); }}
+                />
+              </div>
+              <button className="dw-send-max" onClick={() => setSendAmt(String(walletData?.wallet.formatted ?? ""))}>MAX</button>
+            </div>
+            <button className="dw-send-btn" onClick={handleSend} disabled={sendLoading}>
+              {sendLoading ? "Sending…" : "Send USDC to MetaMask"}
+            </button>
+            {sendErr    && <div className="dw-error">{sendErr}</div>}
+            {sendResult && (
+              <div className="dw-success">
+                ✅ Sent! TX: <a href={`https://arbiscan.io/tx/${sendResult}`} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>{sendResult.slice(0,18)}…</a>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Pending withdrawal notice */}

@@ -1239,6 +1239,40 @@ http
         }
       }
 
+      // ── POST /vault/send-to-wallet — transfer USDC from bot signer to any address ─
+      // Used to move "Wallet Balance" (held at bot signer address) to user's MetaMask.
+      if (u.pathname === "/vault/send-to-wallet" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const b           = await readJson(req);
+          const toAddress: string = String(b.toAddress ?? "").trim();
+          const amountUsdc  = parseFloat(b.amount);
+          if (!toAddress || !/^0x[0-9a-fA-F]{40}$/.test(toAddress))
+            return json(res, 400, { ok: false, error: "Invalid destination address" });
+          if (!amountUsdc || amountUsdc <= 0)
+            return json(res, 400, { ok: false, error: "Invalid amount" });
+
+          const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
+          const amountRaw = BigInt(Math.round(amountUsdc * 10 ** STABLE_DECIMALS));
+          const readC     = getVaultReadContract();
+          const stableAddr: string = await readC.stable();
+          const signer    = getSigner();
+
+          const { Contract } = await import("ethers");
+          const { ERC20_ABI } = await import("./services/onchain/contractInstance.js");
+          const stable = new Contract(stableAddr, ERC20_ABI, signer);
+          const tx = await (stable as any).transfer(toAddress, amountRaw);
+          const receipt = await waitWithFallback(tx);
+
+          log.info({ toAddress, amountUsdc, txHash: receipt.hash }, "[vault] send-to-wallet ✓");
+          return json(res, 200, { ok: true, txHash: receipt.hash, amount: amountUsdc, toAddress });
+        } catch (e: any) {
+          log.error({ err: e?.message }, "[vault] send-to-wallet failed");
+          return json(res, 500, { ok: false, error: e?.reason ?? e?.message ?? String(e) });
+        }
+      }
+
       // ── POST /vault/withdraw — normal 2-step (initiate+approve) or emergency ─
       if (u.pathname === "/vault/withdraw" && req.method === "POST") {
         const err = requireAuth(req);

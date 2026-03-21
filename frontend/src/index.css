@@ -1113,6 +1113,37 @@ a:hover { text-decoration: underline; }
   font-weight: 600;
 }
 
+/* Send-to-MetaMask section */
+.dw-send-section { margin-bottom: 10px; }
+.dw-send-toggle {
+  width: 100%; background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 8px; color: var(--accent); font-size: 12px; font-weight: 600;
+  padding: 8px 12px; cursor: pointer; text-align: left;
+}
+.dw-send-toggle:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.dw-send-form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.dw-send-hint { font-size: 11px; color: var(--text-secondary); }
+.dw-send-input {
+  background: var(--input-bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text-primary); font-size: 13px;
+  padding: 9px 12px; outline: none; width: 100%; box-sizing: border-box;
+}
+.dw-send-input:focus { border-color: var(--accent); }
+.dw-send-row { display: flex; gap: 8px; align-items: center; }
+.dw-send-max {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border: 1px solid var(--accent); border-radius: 6px; color: var(--accent);
+  font-size: 11px; font-weight: 700; padding: 6px 10px; cursor: pointer;
+}
+.dw-send-btn {
+  background: var(--accent); border: none; border-radius: 8px;
+  color: #000; font-size: 13px; font-weight: 700; padding: 10px;
+  cursor: pointer; width: 100%;
+}
+.dw-send-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.dw-send-btn:hover:not(:disabled) { filter: brightness(1.1); }
+
 .dw-pending-notice {
   background: color-mix(in srgb, var(--orange) 10%, transparent);
   border: 1px solid color-mix(in srgb, var(--orange) 30%, transparent);
