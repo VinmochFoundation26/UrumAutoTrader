@@ -26,7 +26,7 @@ const REGIME_KEY  = (u: string, s: string) => `regime:${u}:${s}`;
 const EVENTS_KEY  = "botEvents";
 const PERF_KEY    = (u: string) => `perf:${u}`;
 
-const MAX_EVENTS = 500;
+const MAX_EVENTS = 100;
 const MAX_PERF   = 2_000;
 
 // ── Active trade type (must match botWorker ActiveTrade shape) ────────────────

@@ -65,7 +65,7 @@ export function recordEvent(e: BotEvent) {
 
   // In-memory ring buffer — last 500 events for fast SSE replay
   store.eventHistory.push(e);
-  if (store.eventHistory.length > 500) store.eventHistory.shift();
+  if (store.eventHistory.length > 100) store.eventHistory.shift();
 
   // Persist to Redis (fire-and-forget — never block SSE broadcast)
   redisPushEvent(getRedis(), e).catch(() => {/* Redis errors already logged inside */});

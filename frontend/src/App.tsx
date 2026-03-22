@@ -187,6 +187,10 @@ function calcPnl(pos: Position, currentPrice: number) {
 
 function eventColor(type: string): string {
   if (type === "TRADE_EXECUTED" || type === "POSITION_OPENED") return "var(--green)";
+  if (type === "POSITION_RECOVERED") return "var(--blue)";
+  if (type === "GHOST_TRADE_CLEARED") return "var(--orange)";
+  if (type === "EXIT_SIGNAL") return "var(--blue)";
+  if (type === "CIRCUIT_BREAKER_TRIGGERED") return "var(--red)";
   if (type.includes("CLOSED") || type.includes("EXIT")) return "var(--blue)";
   if (type.includes("FAILED") || type.includes("ERROR")) return "var(--red)";
   if (type === "ATR_BLOCKED") return "var(--orange)";
@@ -197,6 +201,10 @@ function eventColor(type: string): string {
 
 function eventIcon(type: string) {
   if (type === "TRADE_EXECUTED" || type === "POSITION_OPENED") return "🟢";
+  if (type === "POSITION_RECOVERED") return "🔄";
+  if (type === "GHOST_TRADE_CLEARED") return "👻";
+  if (type === "EXIT_SIGNAL") return "🔵";
+  if (type === "CIRCUIT_BREAKER_TRIGGERED") return "🚨";
   if (type.includes("CLOSED") || type.includes("EXIT")) return "🔵";
   if (type.includes("FAILED") || type.includes("ERROR")) return "🔴";
   if (type === "ATR_BLOCKED") return "🟡";
@@ -2259,15 +2267,13 @@ export default function App() {
         const ev: BotEvent = JSON.parse(e.data);
         setEvents(prev => {
           const next = [...prev, ev];
-          if (next.length <= 500) return next;
-          // Always preserve TRADE_EXECUTED, BEST_ENTRY, CANDIDATE_FOUND, POSITION_CLOSED
-          // so entries are never silently scrolled off by high-frequency VOTES events.
-          const critical = new Set(["TRADE_EXECUTED","BEST_ENTRY","CANDIDATE_FOUND","POSITION_CLOSED","CIRCUIT_BREAKER_TRIGGERED","POSITION_RECOVERED"]);
-          const kept: typeof next = [];
+          if (next.length <= 100) return next;
+          // Always preserve critical events so they are never scrolled off by VOTES noise.
+          const critical = new Set(["TRADE_EXECUTED","BEST_ENTRY","CANDIDATE_FOUND","POSITION_CLOSED","CIRCUIT_BREAKER_TRIGGERED","POSITION_RECOVERED","GHOST_TRADE_CLEARED","EXIT_SIGNAL","MAX_HOLD_EXIT"]);
           const routine = next.filter(x => !critical.has(x.type));
           const important = next.filter(x => critical.has(x.type));
-          // Keep last 30 critical events + last 470 routine events = 500 total
-          kept.push(...important.slice(-30), ...routine.slice(-470));
+          // Keep last 10 critical events + last 90 routine events = 100 total
+          const kept = [...important.slice(-10), ...routine.slice(-90)];
           kept.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
           return kept;
         });

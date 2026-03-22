@@ -842,6 +842,13 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
     if (move <= effectiveStop) return true;
   }
 
+  // ── 3. Maximum hold time — dead-capital protection ────────────────────────
+  // If a trade has been open for > 12 hours without reaching the profit gate,
+  // close it at market to free capital for new signals.
+  // Applies even if in profit/loss — better to recycle than hold indefinitely.
+  const MAX_HOLD_MS = 12 * 60 * 60 * 1000; // 12 hours
+  if (Date.now() - Number(t.openedAtMs) >= MAX_HOLD_MS) return true;
+
   return false;
 }
 
@@ -898,7 +905,9 @@ export async function fastExitCheck(
 
   // Mark closing immediately — prevents the 10s scanner from also attempting a close
   t.closing = true;
-  emit(deps as unknown as EngineDeps, { type: "EXIT_SIGNAL", userKey, symbol, timeframe: t.timeframe, reason: "risk_exit" });
+  const heldMs = Date.now() - Number(t.openedAtMs);
+  const exitReason = heldMs >= 12 * 60 * 60 * 1000 ? "max_hold_exit" : "risk_exit";
+  emit(deps as unknown as EngineDeps, { type: "EXIT_SIGNAL", userKey, symbol, timeframe: t.timeframe, reason: exitReason, heldMinutes: Math.round(heldMs / 60000) });
 
   try {
     await deps.closePosition({ userKey, symbol, timeframe: t.timeframe, exitPriceWad: priceWad });
