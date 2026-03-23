@@ -104,7 +104,8 @@ function scoreCandidate(v: VotesEvent, side: "LONG" | "SHORT") {
   return (base + marginBonus + exceedBonus) * w;
 }
 
-const MAX_CONCURRENT_TRADES = 3; // VaultV2 supports up to 3 concurrent positions
+// Read from env (MAX_CONCURRENT_TRADES=1 in .env overrides the vault max of 3)
+const MAX_CONCURRENT_TRADES = Number(process.env.MAX_CONCURRENT_TRADES ?? "3");
 
 // On bot startup: read open positions from chain and register them in activeTrades
 // so the exit logic (stop-loss / profit-reversal) picks them up without needing a restart.
@@ -186,9 +187,9 @@ async function getOpenCount(userKey: string): Promise<number> {
   }
 }
 
-async function isAtMaxCapacity(userKey: string): Promise<boolean> {
+async function isAtMaxCapacity(userKey: string, limit: number): Promise<boolean> {
   const count = await getOpenCount(userKey);
-  return count >= MAX_CONCURRENT_TRADES;
+  return count >= limit;
 }
 
 let timer: NodeJS.Timeout | null = null;

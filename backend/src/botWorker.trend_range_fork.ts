@@ -38,25 +38,25 @@ export function symbolMaxLev(symbol: string): number {
 }
 
 export type BotConfig = {
-  STOP_LOSS_PCT: number;              // e.g. 0.03 = 3%
-  EXIT_ON_PROFIT_REVERSAL: number;    // trail gap  — 0.03 = give back 3% leveraged from the peak before exiting
-  MIN_PROFIT_BEFORE_REVERSAL: number; // gate       — 0.05 = trail only activates once peak reaches 5% leveraged
-                                      //              also acts as the exit floor: effectiveStop = max(gate, peak−trail)
-  DEFAULT_LEVERAGE: number;           // e.g. 5  (user's chosen leverage before symbol cap)
+  STOP_LOSS_PCT: number;              // hard stop   — 0.015 = 1.5% raw → 15% lev loss at 10×
+  EXIT_ON_PROFIT_REVERSAL: number;    // step size   — 0.03 = 3% lev per step (0.3% raw at 10×)
+  MIN_PROFIT_BEFORE_REVERSAL: number; // min gate    — 0.03 = 3% lev (0.3% raw) — first staircase step
+  PROFIT_LOCK_GATE: number;           // major gate  — 0.30 = 30% lev (3% raw) — floor locks here permanently once hit
+  DEFAULT_LEVERAGE: number;           // e.g. 10
   MAX_LEVERAGE: number;               // soft user ceiling (further capped by SYMBOL_MAX_LEVERAGE)
   COOLDOWN_SECONDS: number;           // e.g. 600
   VOTE_REQUIRED: number;              // e.g. 5 — minimum votes to fire an entry
   ATR_PERIOD: number;                 // e.g. 14 — ATR lookback period (close-to-close)
-  ATR_VOLATILITY_THRESHOLD: number;   // e.g. 0.005 = 0.5% — skip entry above this ATR%
+  ATR_VOLATILITY_THRESHOLD: number;   // e.g. 0.008 = 0.8% — skip entry above this ATR%
   MANUAL_SIZE_PCT: number;            // 0 = auto ATR-scaled; >0 = fixed % of vault per trade (e.g. 0.10 = 10%)
 };
 
 export const DEFAULT_CFG: BotConfig = {
-  STOP_LOSS_PCT: 0.01,         // Tier 1 (10×–30×): 1% raw stop → 30% lev loss, safe before liquidation @ 30×
+  STOP_LOSS_PCT: 0.015,        // Tier 1 (10×–30×): 1.5% raw stop → 15% lev loss at 10×
                                // Tier 2 (40×–100×): overridden dynamically to 0.5–0.8% ATR-scaled (see shouldExit)
-  EXIT_ON_PROFIT_REVERSAL: 0.03,    // trail gap   — 3% give-back from peak (tight, preserves big-runner gains)
-  MIN_PROFIT_BEFORE_REVERSAL: 0.30, // gate/floor  — trail activates once peak ≥ 30% leveraged (= 3% actual at 10×);
-                                    //               also the minimum exit level (floor)
+  EXIT_ON_PROFIT_REVERSAL: 0.03,    // step size   — 3% lev per staircase step (0.3% raw at 10×)
+  MIN_PROFIT_BEFORE_REVERSAL: 0.03, // min gate    — trail arms at 3% lev (0.3% raw at 10×) — first staircase step
+  PROFIT_LOCK_GATE: 0.30,           // major gate  — 30% lev (3% raw at 10×) — floor permanently locked once hit
   DEFAULT_LEVERAGE: 10,
   MAX_LEVERAGE: 100,           // raised; symbol cap enforced separately
   COOLDOWN_SECONDS: 600,
@@ -90,9 +90,12 @@ export function validateConfig(raw: Partial<Record<keyof BotConfig, unknown>>): 
   const atrT  = asNum(raw.ATR_VOLATILITY_THRESHOLD) ?? DEFAULT_CFG.ATR_VOLATILITY_THRESHOLD;
   const msp   = asNum(raw.MANUAL_SIZE_PCT) ?? DEFAULT_CFG.MANUAL_SIZE_PCT;
 
-  const STOP_LOSS_PCT              = clamp(stop, 0.001, 0.20);   // 0.1% .. 20%
-  const EXIT_ON_PROFIT_REVERSAL    = clamp(rev,  0.001, 0.50);   // 0.1% .. 50%  — trail gap from peak
-  const MIN_PROFIT_BEFORE_REVERSAL = clamp(minP, 0.001, 0.50);   // 0.1% .. 50% — gate/floor (must reach this leveraged peak to activate trail)
+  const lockG = asNum(raw.PROFIT_LOCK_GATE) ?? DEFAULT_CFG.PROFIT_LOCK_GATE;
+
+  const STOP_LOSS_PCT              = clamp(stop,  0.001, 0.20);  // 0.1% .. 20% raw
+  const EXIT_ON_PROFIT_REVERSAL    = clamp(rev,   0.001, 0.50);  // step size — 3% lev per step
+  const MIN_PROFIT_BEFORE_REVERSAL = clamp(minP,  0.001, 0.50);  // min gate — first step activation
+  const PROFIT_LOCK_GATE           = clamp(lockG, 0.001, 1.00);  // major gate — permanent floor once hit
 
   // User sets their own ceiling; per-symbol hard cap is enforced at entry time
   const MAX_LEVERAGE     = clamp(Math.floor(maxL), 1, 100);
@@ -110,6 +113,7 @@ export function validateConfig(raw: Partial<Record<keyof BotConfig, unknown>>): 
     STOP_LOSS_PCT,
     EXIT_ON_PROFIT_REVERSAL,
     MIN_PROFIT_BEFORE_REVERSAL,
+    PROFIT_LOCK_GATE,
     DEFAULT_LEVERAGE,
     MAX_LEVERAGE,
     COOLDOWN_SECONDS,
@@ -809,36 +813,46 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   // from anchoring the trail gate.
   if (advanceBestPrice) updateBest(t, candleExtreme ?? price);
 
-  // ── 2. Profit-reversal trailing stop (LEVERAGED PnL terms) ─────────────────
-  // Two decoupled knobs (both in leveraged PnL %):
+  // ── 2. Two-gate ratcheting staircase (LEVERAGED PnL terms) ──────────────────
   //
-  //   GATE  = MIN_PROFIT_BEFORE_REVERSAL (0.30 = 30% leveraged = 3% actual at 10×)
-  //     — The peak must reach this level before the trailing stop activates.
-  //     — Also serves as the exit floor: we never exit below it once triggered.
-  //     — Trades that never reach the gate continue running until stop-loss.
+  //   MIN GATE  = MIN_PROFIT_BEFORE_REVERSAL (0.03 = 3% lev = 0.3% raw at 10×)
+  //     — First step: trailing stop arms here. Any profit seen is locked.
   //
-  //   TRAIL = EXIT_ON_PROFIT_REVERSAL    (0.03 = 3% leveraged = 0.3% actual at 10×)
-  //     — Give-back allowed from the leveraged peak before exiting.
-  //     — Kept tight (3% lev) so large runners still capture most of their gains.
+  //   STEP SIZE = EXIT_ON_PROFIT_REVERSAL    (0.03 = 3% lev = 0.3% raw at 10×)
+  //     — Give-back allowed per step. Floor ratchets up every 3% lev.
   //
-  //   effectiveStop = max(gate, peak − trail)
+  //   MAJOR GATE = PROFIT_LOCK_GATE          (0.30 = 30% lev = 3% raw at 10×)
+  //     — Once peak hits this level, floor permanently locks at 30% lev.
+  //     — Trades that never reach major gate keep ratcheting from min gate up.
   //
-  // Behaviour table (GATE=30% lev, TRAIL=3% lev, at 10× leverage):
-  //   peak = 20% lev (2% act)  → gate not reached → hold (trade continues)
-  //   peak = 30% lev (3% act)  → gate hit; effectiveStop = max(30%, 27%) = 30%  ← floor = 3% act exit
-  //   peak = 40% lev (4% act)  → effectiveStop = max(30%, 37%) = 37%            ← trail ≈ 3.7% act
-  //   peak = 60% lev (6% act)  → effectiveStop = max(30%, 57%) = 57%            ← trail ≈ 5.7% act
-  //   peak =100% lev (10% act) → effectiveStop = max(30%, 97%) = 97%            ← trail ≈ 9.7% act
+  //   effectiveStop = max(minGate, peak − step)
+  //   if peak >= majorGate: effectiveStop = max(effectiveStop, majorGate)
+  //
+  // Staircase table (at 10× leverage, step = 3% lev = 0.3% raw):
+  //   peak =  3% lev (0.3% raw) → floor =  3% lev — any dip exits with profit ✓
+  //   peak =  6% lev (0.6% raw) → floor =  3% lev (one step below peak)
+  //   peak =  9% lev (0.9% raw) → floor =  6% lev
+  //   peak = 12% lev (1.2% raw) → floor =  9% lev
+  //   peak = 15% lev (1.5% raw) → floor = 12% lev
+  //   peak = 18% lev (1.8% raw) → floor = 15% lev
+  //   peak = 21% lev (2.1% raw) → floor = 18% lev
+  //   peak = 24% lev (2.4% raw) → floor = 21% lev
+  //   peak = 27% lev (2.7% raw) → floor = 24% lev
+  //   peak = 30% lev (3.0% raw) → floor = 30% lev ← MAJOR GATE LOCKS HERE
+  //   peak = 40% lev (4.0% raw) → floor = 37% lev (trailing above major gate)
   // ───────────────────────────────────────────────────────────────────────────
-  const levWad   = toWad(t.leverage);
-  const move     = mulWad(rawMove, levWad);                        // leveraged current PnL
-  const bestMove = mulWad(movePctWad(t, t.bestPriceWad), levWad); // leveraged peak PnL
-  const gate     = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);         // 30% lev (3% actual at 10×) — activation gate + floor
-  const trail    = toWad(cfg.EXIT_ON_PROFIT_REVERSAL);            // 3% lev (0.3% actual at 10×) — give-back from peak
+  const levWad    = toWad(t.leverage);
+  const move      = mulWad(rawMove, levWad);                        // leveraged current PnL
+  const bestMove  = mulWad(movePctWad(t, t.bestPriceWad), levWad); // leveraged peak PnL
+  const minGate   = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);         // 3% lev  — first step
+  const lockGate  = toWad(cfg.PROFIT_LOCK_GATE);                   // 30% lev — major gate, permanent floor
+  const trail     = toWad(cfg.EXIT_ON_PROFIT_REVERSAL);            // 3% lev  — step size / give-back
 
-  if (bestMove >= gate) {
-    const trailLevel    = bestMove - trail;                        // e.g. 22% − 3% = 19%
-    const effectiveStop = trailLevel > gate ? trailLevel : gate;   // max(floor=5%, trail)
+  if (bestMove >= minGate) {
+    const trailLevel = bestMove - trail;
+    let effectiveStop = trailLevel > minGate ? trailLevel : minGate; // max(minGate, peak − step)
+    // Major gate: once peak reaches lockGate, snap floor up permanently
+    if (bestMove >= lockGate && effectiveStop < lockGate) effectiveStop = lockGate;
     if (move <= effectiveStop) return true;
   }
 
@@ -1783,7 +1797,11 @@ if (sizeWad <= 0n) {
       }
     }
 
-    emit(deps, { type: "POSITION_OPENED", userKey, symbol, timeframe, side: out.decided, leverage, result });
+    // Only emit POSITION_OPENED for real on-chain trades.
+    // Paper/scan-phase candidates (result.paper === true) are not real positions.
+    if (!result?.paper) {
+      emit(deps, { type: "POSITION_OPENED", userKey, symbol, timeframe, side: out.decided, leverage, result });
+    }
   } catch (e: any) {
     // activeTrades was never set, so no cleanup needed
     emit(deps, { type: "ENTRY_FAILED", userKey, symbol, timeframe, side: out.decided, leverage, error: e?.message ?? String(e) });

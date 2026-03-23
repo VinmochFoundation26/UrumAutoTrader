@@ -41,6 +41,7 @@ import { checkCircuitBreaker } from "./drawdownGuard.js";
 import { extractFeatures, getAiScore } from "../ai/signalScorer.js";
 import { reconcilePendingTxs } from "../onchain/txTracker.js";
 import { getUsdmFuturesSymbols } from "../market/binanceCandles.js";
+import { getUserTradingConfig } from "../users/userTradingConfig.js";
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -92,7 +93,8 @@ const TF_WEIGHT: Record<string, number> = {
   "4h": 1.35,
 };
 
-const MAX_CONCURRENT_TRADES = 3;
+// Read from env (MAX_CONCURRENT_TRADES=1 in .env overrides the vault max of 3)
+const MAX_CONCURRENT_TRADES = Number(process.env.MAX_CONCURRENT_TRADES ?? "3");
 
 // ── Helpers (mirrors runner.ts private helpers) ───────────────────────────────
 
@@ -199,6 +201,7 @@ export class BotWorkerInstance {
   private startedAt              = 0;
   private validSymbols:            string[]              = [];
   private dropped:                 string[]              = [];
+  private maxConcurrent:           number                = MAX_CONCURRENT_TRADES;
 
   // ── Constructor params ──────────────────────────────────────────────────────
   readonly userKey:  string;
@@ -263,6 +266,21 @@ export class BotWorkerInstance {
     this.validSymbols = valid;
     this.dropped      = dropped;
 
+    // ── Per-user trading config overrides ────────────────────────────────────
+    if (deps.redis) {
+      try {
+        const userCfg = await getUserTradingConfig(deps.redis, userKey);
+        if (userCfg.maxConcurrentTrades) this.maxConcurrent = userCfg.maxConcurrentTrades;
+        if (userCfg.maxLeverage)         (cfg as any).DEFAULT_LEVERAGE = userCfg.maxLeverage;
+        if (userCfg.symbols?.length)     valid = userCfg.symbols;
+        if (Object.keys(userCfg).length > 0) {
+          log.info({ userKey, userCfg }, "[botWorkerInstance] per-user trading config applied");
+        }
+      } catch (e: any) {
+        log.warn({ err: e?.message, userKey }, "[botWorkerInstance] failed to load per-user trading config (non-fatal)");
+      }
+    }
+
     // ── TX reconciliation (Phase 1) ──────────────────────────────────────────
     if (deps.redis) {
       try {
@@ -312,11 +330,11 @@ export class BotWorkerInstance {
       let atCapacity = false;
       try {
         openCount  = await getOpenCount(userKey);
-        atCapacity = openCount >= MAX_CONCURRENT_TRADES;
+        atCapacity = openCount >= this.maxConcurrent;
         if (atCapacity) {
           deps.emit({
             ts: Date.now(), type: "ENTRY_BLOCKED", userKey, openCount,
-            reason: `max concurrent positions reached (${openCount}/${MAX_CONCURRENT_TRADES}); new entries blocked`,
+            reason: `max concurrent positions reached (${openCount}/${this.maxConcurrent}); new entries blocked`,
           });
         }
       } catch (e: any) {
