@@ -52,7 +52,7 @@ export type BotConfig = {
 };
 
 export const DEFAULT_CFG: BotConfig = {
-  STOP_LOSS_PCT: 0.015,        // Tier 1 (10×–30×): 1.5% raw stop → 15% lev loss at 10×
+  STOP_LOSS_PCT: 0.01,         // Tier 1 (10×–30×): 1% raw stop → 10% lev loss at 10×
                                // Tier 2 (40×–100×): overridden dynamically to 0.5–0.8% ATR-scaled (see shouldExit)
   EXIT_ON_PROFIT_REVERSAL: 0.03,    // step size   — 3% lev per staircase step (0.3% raw at 10×)
   MIN_PROFIT_BEFORE_REVERSAL: 0.03, // min gate    — trail arms at 3% lev (0.3% raw at 10×) — first staircase step
@@ -781,9 +781,9 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   // ── 1. Hard stop-loss — leverage-tiered ────────────────────────────────────
   //
   // TIER 1 (10×–30×): fixed 1% raw stop  (cfg.STOP_LOSS_PCT = 0.01)
-  //   • 1% raw × 30× = 30% leveraged loss at stop
+  //   • 1% raw × 10× = 10% leveraged loss at stop
   //   • Liquidation at 3.33% raw → 2.33% safety buffer ✅
-  //   • Vault loss per stop: 1% × 30 × 15% collateral = 4.5% of vault
+  //   • Vault loss per stop: 1% × 10 × 15% collateral = 1.5% of vault
   //
   // TIER 2 (40×–100×): ATR-scaled stop, 0.5%–0.8% raw
   //   • Equal-risk formula: baseStop = clamp(0.30 / leverage, 0.5%, 0.8%)
