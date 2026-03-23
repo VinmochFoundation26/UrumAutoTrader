@@ -861,8 +861,10 @@ http
 
       // ── Close all open on-chain positions (admin) ─────────────────────────
       if (u.pathname === "/bot/closeall" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+        // Accept either JWT bearer token OR X-Admin-Key header
+        const adminKeyErr = requireAdmin(req);
+        const jwtErr      = requireAuth(req);
+        if (adminKeyErr !== null && jwtErr !== null) return json(res, 401, { ok: false, error: "unauthorized" });
         try {
           const user = currentUserAddress;
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });

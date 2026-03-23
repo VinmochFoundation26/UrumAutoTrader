@@ -393,7 +393,7 @@ export async function restoreState(
         // pendingBestWad defaults to bestPriceWad if not stored (backwards-compat)
         pendingBestWad:  ct.pendingBestWad ? BigInt(ct.pendingBestWad) : BigInt(ct.bestPriceWad),
         sizeWad:         BigInt(ct.sizeWad),
-        openedAtMs: ct.openedAtMs,
+        openedAtMs: ct.openedAtMs ?? Date.now(), // fallback: treat legacy trades (no timestamp) as just opened — they'll be recycled by 12h gate on next restart
         pending: false,
         closing: false,
       };
