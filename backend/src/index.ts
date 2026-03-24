@@ -41,7 +41,7 @@ import { connectRedis, disconnectRedis, getRedis } from "./services/cache/redis.
 import { restoreEventHistory } from "./services/bot/state.js";
 import { startPriceStream, stopPriceStream, getLatestPrice, getAllPrices, updateStreamSymbols } from "./services/market/priceStream.js";
 import { assertOnchainReady, getVaultReadContract } from "./services/onchain/contractInstance.js";
-import { startEngine, stopEngine } from "./services/bot/runner.js";
+import { stopEngine } from "./services/bot/runner.js";
 import { getState, setRunning, recordError, addSseClient, getEventHistory } from "./services/bot/state.js";
 import { getVaultBalances } from "./services/onchain/vaultViews.js";
 import { validateConfig, CFG_KEYS, symbolMaxLev } from "./botWorker.trend_range_fork.js";
@@ -76,11 +76,6 @@ setInterval(() => {
   for (const [k, v] of _rlMap) if (now > v.resetAt) _rlMap.delete(k);
 }, 5 * 60_000).unref();
 
-// @deprecated — global mutable user address. Use JWT-derived userKey or ?user= param.
-// Will be removed once all routes migrate to resolveUserKey().
-// Prefer TEST_USER_ADDRESS, but keep TEST_USER_KEY for backward compatibility
-let currentUserAddress = process.env.TEST_USER_ADDRESS ?? process.env.TEST_USER_KEY ?? "";
-
 // Source of truth: SYMBOLS only (no whitelist)
 let currentSymbols: string[] = (process.env.SYMBOLS ?? "ETHUSDT")
   .split(",")
@@ -97,33 +92,6 @@ let currentTrigger = {
   stochMid: Number(process.env.STOCH_MID ?? "50"),
   stochDLen: Number(process.env.STOCH_D_LEN ?? "3"),
 };
-
-// Redis key for persisting engine run state across restarts
-const REDIS_ENGINE_KEY = "bot:engine:autostart";
-
-async function persistEngineState(running: boolean) {
-  try {
-    const redis = getRedis();
-    if (running) {
-      await redis.set(REDIS_ENGINE_KEY, JSON.stringify({
-        running: true,
-        userKey: currentUserAddress,
-        symbols: currentSymbols,
-        trigger: currentTrigger,
-        savedAt: Date.now(),
-      }));
-    } else {
-      await redis.del(REDIS_ENGINE_KEY);
-    }
-  } catch { /* non-fatal */ }
-}
-
-async function startBot(args: { userKey: string; symbols: string[]; trigger?: typeof currentTrigger }) {
-  return await startEngine(args);
-}
-function stopBot() {
-  return stopEngine();
-}
 
 function normalizeSymbols(list: any): string[] {
   const arr = Array.isArray(list)
@@ -186,9 +154,8 @@ async function auditLog(adminId: string, action: string, targetUserId: string, d
 
 /**
  * Resolves the active userKey for a request using priority:
- *   1. ?user= query param (allowed for admin only in production)
+ *   1. ?user= query param
  *   2. JWT-derived wallet address from the authenticated user record
- *   3. currentUserAddress fallback (deprecated)
  */
 async function resolveUserKey(
   req: http.IncomingMessage,
@@ -207,8 +174,7 @@ async function resolveUserKey(
     }
   } catch { /* non-fatal */ }
 
-  // 3. Fallback
-  return currentUserAddress;
+  return "";
 }
 
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
@@ -670,10 +636,11 @@ http
       }
 
       if (u.pathname === "/bot/state") {
+        const userKey = await resolveUserKey(req, u);
         return json(res, 200, {
           ok: true,
           config: {
-            userAddress: currentUserAddress,
+            userAddress: userKey,
             symbols: currentSymbols,
             strategy: currentStrategy,
             trigger: currentTrigger,
@@ -684,7 +651,7 @@ http
 
       // View vault balances (read-only)
       if (u.pathname === "/vault/balances") {
-        const user = u.searchParams.get("user") ?? currentUserAddress;
+        const user = await resolveUserKey(req, u);
         if (!user) return json(res, 400, { ok: false, error: "missing user" });
         const r = await getVaultBalances(user);
         return json(res, 200, { ok: true, user, balances: r });
@@ -692,7 +659,7 @@ http
 
       // Debug: see all open positions for a user
       if (u.pathname === "/vault/position") {
-        const user = u.searchParams.get("user") ?? currentUserAddress;
+        const user = await resolveUserKey(req, u);
         if (!user) return json(res, 400, { ok: false, error: "missing user" });
         const c = getVaultReadContract();
         const markets: string[] = await c.getOpenMarkets(user);
@@ -716,8 +683,6 @@ http
         if (err) return json(res, 401, { ok: false, error: err });
         try {
           const b = await readJson(req);
-          if (typeof b.userAddress === "string") currentUserAddress = b.userAddress;
-          if (typeof b.userKey === "string") currentUserAddress = b.userKey;
           if (b.symbols != null) {
             const next = normalizeSymbols(b.symbols);
             if (!next.length) return json(res, 400, { ok: false, error: "no valid symbols after normalization" });
@@ -732,9 +697,10 @@ http
             if (typeof t.stochMid === "number") currentTrigger.stochMid = t.stochMid;
             if (typeof t.stochDLen === "number") currentTrigger.stochDLen = t.stochDLen;
           }
+          const userKey = await resolveUserKey(req, u);
           return json(res, 200, {
             ok: true,
-            config: { userAddress: currentUserAddress, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
+            config: { userAddress: userKey, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
           });
         } catch (e: any) {
           return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
@@ -770,58 +736,6 @@ http
         }
       }
 
-      // @deprecated — migrate to POST /pool/start. This route uses the global
-      // currentUserAddress and is not safe for multi-user operation.
-      if (u.pathname === "/bot/start") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
-        res.setHeader("Deprecation", "true");
-        res.setHeader("Sunset", "2026-12-31");
-        log.warn("[DEPRECATED] POST /bot/start — migrate to POST /pool/start");
-        if (!currentUserAddress) return json(res, 400, { ok: false, error: "Set TEST_USER_ADDRESS env or POST /bot/set" });
-        currentSymbols = normalizeSymbols(currentSymbols);
-        if (!currentSymbols.length) return json(res, 400, { ok: false, error: "no valid symbols configured" });
-
-        // ── Subscription gate ─────────────────────────────────────────────────
-        // Block the bot from starting if the user's subscription (or trial) has expired.
-        // Admins bypass the check — they can always start the engine.
-        const startPayload = decodeToken(req);
-        const startUserId  = startPayload?.userId ?? "legacy";
-        if (startUserId !== "legacy" && startPayload?.role !== "admin") {
-          const startUser = await getUserById(getRedis(), startUserId).catch(() => null);
-          const subStatus = await checkSubscription(
-            getRedis(), startUserId, startUser?.trialExpiresAt ?? null
-          );
-          if (!subStatus.active) {
-            return json(res, 403, {
-              ok: false,
-              error: "Subscription expired — please renew to continue trading",
-              subscriptionStatus: subStatus,
-              renewUrl: "/subscription/pay",
-            });
-          }
-        }
-
-        const r = await startBot({ userKey: currentUserAddress, symbols: currentSymbols, trigger: currentTrigger });
-        setRunning(true);
-        await persistEngineState(true);   // survive backend restart
-        return json(res, 200, r);
-      }
-
-      // @deprecated — migrate to POST /pool/stop. This route uses the global
-      // currentUserAddress and is not safe for multi-user operation.
-      if (u.pathname === "/bot/stop") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
-        res.setHeader("Deprecation", "true");
-        res.setHeader("Sunset", "2026-12-31");
-        log.warn("[DEPRECATED] POST /bot/stop — migrate to POST /pool/stop");
-        const r = stopBot();
-        setRunning(false);
-        await persistEngineState(false);  // clear autostart flag
-        return json(res, 200, r);
-      }
-
       // ── POST /pool/start — start bot for a specific user (admin) ─────────
       if (u.pathname === "/pool/start" && req.method === "POST") {
         const adminResult = await requireAdminRole(req);
@@ -833,6 +747,7 @@ http
           const rawSyms   = b.symbols ?? currentSymbols;
           const symbols   = normalizeSymbols(rawSyms);
           const trigger   = b.trigger ?? currentTrigger;
+          const strategy  = (b.strategy ?? "trend_range_fork") as import("./services/bot/botWorkerInstance.js").StrategyMode;
 
           if (!userKey) return json(res, 400, { ok: false, error: "userKey required" });
           if (!symbols.length) return json(res, 400, { ok: false, error: "at least one symbol required" });
@@ -841,6 +756,7 @@ http
             userKey,
             symbols,
             trigger,
+            strategy,
             userId:        userId  || undefined,
             skipSubCheck:  !userId,   // skip if no userId provided (admin override)
           });
@@ -1003,8 +919,8 @@ http
         // Determine userKey for filtering:
         // 1. Admin/support role → use "*" (all events) or ?userKey= param
         // 2. User role → derive from JWT-linked wallet address
-        // 3. No token → fallback to currentUserAddress (backward compat)
-        let sseUserKey: string = currentUserAddress || "*";
+        // 3. No token → show all events ("*")
+        let sseUserKey: string = "*";
         const ssePayload = decodeToken(req);
         if (ssePayload?.userId) {
           if (ssePayload.role === "admin" || ssePayload.role === "support") {
@@ -1014,8 +930,8 @@ http
             // Regular user: look up wallet address from user record
             try {
               const sseUser = await getUserById(getRedis(), ssePayload.userId).catch(() => null);
-              sseUserKey = sseUser?.walletAddress || currentUserAddress || "*";
-            } catch { /* non-fatal — fall back to currentUserAddress */ }
+              sseUserKey = sseUser?.walletAddress || "*";
+            } catch { /* non-fatal */ }
           }
         }
 
@@ -1196,7 +1112,7 @@ http
       // ── GET /vault/wallet-balance — wallet USDC + vault + fees + pending ──────
       if (u.pathname === "/vault/wallet-balance") {
         try {
-          const user = u.searchParams.get("user") ?? currentUserAddress;
+          const user = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "missing user" });
           const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
           const readC = getVaultReadContract();
@@ -1351,7 +1267,7 @@ http
           const signer   = getSigner();
           const writeC   = getVaultWriteContract();
           const readC    = getVaultReadContract();
-          const user     = currentUserAddress;
+          const user     = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           // Resolve amount: number or "all"
@@ -1441,7 +1357,7 @@ http
           const netAmountRaw = BigInt(b.netAmountRaw); // net after platform fee, as string
           const grossAmount  = parseFloat(b.grossAmount);
           const mode         = (b.mode ?? "normal") as "normal" | "emergency";
-          const user         = currentUserAddress;
+          const user         = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           const signer  = getSigner();
@@ -1486,7 +1402,7 @@ http
           const grossAmount = parseFloat(b.grossAmount);
           const txHash      = b.txHash as string;
           const readC       = getVaultReadContract();
-          const user        = currentUserAddress;
+          const user        = await resolveUserKey(req, u);
           const stableX18: bigint = await readC.stableBalanceX18(user ?? "");
           const vaultBalanceUsdc   = +(Number(stableX18) / 1e18).toFixed(6);
           const fees = await recordWithdrawal(getRedis(), userId, grossAmount, vaultBalanceUsdc, "emergency", txHash);
@@ -1560,13 +1476,6 @@ http
           blockNumber = Number(await provider.getBlockNumber());
           chainOk = blockNumber > 0;
         } catch { /* */ }
-        // Open positions count
-        let openPositions = 0;
-        try {
-          const c = getVaultReadContract();
-          const markets: string[] = await (c as any).getOpenMarkets(currentUserAddress);
-          openPositions = Array.isArray(markets) ? markets.length : 0;
-        } catch { /* */ }
         return json(res, 200, {
           ok: true,
           services: {
@@ -1574,7 +1483,7 @@ http
             redis: { status: redisOk ? "operational" : "degraded" },
             chain: { status: chainOk ? "operational" : "degraded", blockNumber },
           },
-          openPositions,
+          activeWorkers: workerPool.size,
           timestamp: Date.now(),
         });
       }
@@ -1625,30 +1534,6 @@ http
       // 4. Verify on-chain connection
       await assertOnchainReady();
 
-      // 5. Auto-restart engine if it was running before crash/restart
-      try {
-        const redis = getRedis();
-        const saved = await redis.get(REDIS_ENGINE_KEY);
-        if (saved) {
-          const s = JSON.parse(saved);
-          if (s.running && s.userKey) {
-            // Restore symbols/trigger from saved state (user may not be at dashboard)
-            if (Array.isArray(s.symbols) && s.symbols.length) currentSymbols = s.symbols;
-            if (s.trigger) currentTrigger = s.trigger;
-            // Sync price stream to the restored symbol list — the stream was started
-            // at step 3 with the process.env.SYMBOLS default, which may differ from
-            // what was saved in Redis (e.g. after a symbol swap via dashboard/Redis).
-            updateStreamSymbols(currentSymbols);
-            log.info({ symbols: currentSymbols }, "[server] auto-resuming engine after restart");
-            // Use workerPool.startUser() for multi-user safe restart
-            await workerPool.startUser({ userKey: s.userKey, symbols: currentSymbols, trigger: currentTrigger, skipSubCheck: true });
-            setRunning(true);
-          }
-        }
-      } catch (e: any) {
-        log.warn({ err: e?.message }, "[server] auto-restart check failed (non-fatal)");
-      }
-
       log.info({ port: PORT, symbols: currentSymbols }, "[server] ready ✓");
     } catch (e: any) {
       log.error({ err: e?.message }, "[server] startup error");
@@ -1685,6 +1570,7 @@ process.on("unhandledRejection", (reason: any) => {
 process.on("SIGTERM", async () => {
   log.info("[process] SIGTERM received — shutting down");
   stopPriceStream();
+  workerPool.stopAll();
   stopEngine();
   await disconnectRedis();
   process.exit(0);
@@ -1693,6 +1579,7 @@ process.on("SIGTERM", async () => {
 process.on("SIGINT", async () => {
   log.info("[process] SIGINT received — shutting down");
   stopPriceStream();
+  workerPool.stopAll();
   stopEngine();
   await disconnectRedis();
   process.exit(0);

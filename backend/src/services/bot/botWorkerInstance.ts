@@ -21,10 +21,61 @@ import path from "node:path";
 
 import {
   evaluateUserSymbol as evalTrendRangeFork,
-  registerTradeAfterExecution,
-  restoreState,
-  fastExitCheck,
+  registerTradeAfterExecution as registerTRF,
+  restoreState as restoreStateTRF,
+  fastExitCheck as fastExitTRF,
 } from "../../botWorker.trend_range_fork.js";
+import {
+  evaluateUserSymbol as evalScalping,
+  registerTradeAfterExecution as registerScalping,
+  restoreState as restoreStateScalping,
+  fastExitCheck as fastExitScalping,
+} from "../../botWorker.scalping.js";
+import {
+  evaluateUserSymbol as evalMeanReversion,
+  registerTradeAfterExecution as registerMeanReversion,
+  restoreState as restoreStateMeanReversion,
+  fastExitCheck as fastExitMeanReversion,
+} from "../../botWorker.mean_reversion.js";
+import {
+  evaluateUserSymbol as evalBreakout,
+  registerTradeAfterExecution as registerBreakout,
+  restoreState as restoreStateBreakout,
+  fastExitCheck as fastExitBreakout,
+} from "../../botWorker.breakout.js";
+
+export type StrategyMode = "trend_range_fork" | "scalping" | "mean_reversion" | "breakout";
+
+const STRATEGY_MAP = {
+  trend_range_fork: {
+    eval: evalTrendRangeFork,
+    register: registerTRF,
+    restore: restoreStateTRF,
+    fastExit: fastExitTRF,
+    defaultTimeframes: ["1h", "5m"],
+  },
+  scalping: {
+    eval: evalScalping,
+    register: registerScalping,
+    restore: restoreStateScalping,
+    fastExit: fastExitScalping,
+    defaultTimeframes: ["1m", "3m"],
+  },
+  mean_reversion: {
+    eval: evalMeanReversion,
+    register: registerMeanReversion,
+    restore: restoreStateMeanReversion,
+    fastExit: fastExitMeanReversion,
+    defaultTimeframes: ["15m", "1h"],
+  },
+  breakout: {
+    eval: evalBreakout,
+    register: registerBreakout,
+    restore: restoreStateBreakout,
+    fastExit: fastExitBreakout,
+    defaultTimeframes: ["1h", "4h"],
+  },
+} as const;
 import { getLatestPrice } from "../market/priceStream.js";
 import { makeEngineDeps } from "./deps.js";
 import type { EngineDeps } from "./deps.js";
@@ -144,10 +195,11 @@ async function getOpenCount(userKey: string): Promise<number> {
 }
 
 async function recoverOpenPositions(
-  userKey:  string,
-  symbols:  string[],
-  leverage: number,
-  deps:     any,
+  userKey:   string,
+  symbols:   string[],
+  leverage:  number,
+  deps:      any,
+  registerFn: (args: any) => void,
 ): Promise<void> {
   try {
     const vault   = getVaultContract();
@@ -167,7 +219,7 @@ async function recoverOpenPositions(
       const entryPriceWad = BigInt(pos.entryPriceX18.toString());
       const sizeWad       = BigInt(pos.sizeX18.toString());
 
-      registerTradeAfterExecution({
+      registerFn({
         userKey,
         symbol:       sym,
         timeframe:    "5m",
@@ -204,16 +256,18 @@ export class BotWorkerInstance {
   private maxConcurrent:           number                = MAX_CONCURRENT_TRADES;
 
   // ── Constructor params ──────────────────────────────────────────────────────
-  readonly userKey:  string;
-  private symbols:   string[];
-  private trigger:   TriggerConfig;
-  private deps:      EngineDeps;
+  readonly userKey:   string;
+  private symbols:    string[];
+  private trigger:    TriggerConfig;
+  private deps:       EngineDeps;
+  private strategyMode: StrategyMode;
 
-  constructor(userKey: string, symbols: string[], trigger: TriggerConfig, deps: EngineDeps) {
-    this.userKey  = userKey;
-    this.symbols  = symbols;
-    this.trigger  = trigger;
-    this.deps     = deps;
+  constructor(userKey: string, symbols: string[], trigger: TriggerConfig, deps: EngineDeps, strategyMode: StrategyMode = "trend_range_fork") {
+    this.userKey      = userKey;
+    this.symbols      = symbols;
+    this.trigger      = trigger;
+    this.deps         = deps;
+    this.strategyMode = strategyMode;
   }
 
   // ── start() ─────────────────────────────────────────────────────────────────
@@ -229,15 +283,21 @@ export class BotWorkerInstance {
       return { ok: true, running: true, symbols: this.validSymbols, dropped: this.dropped };
     }
 
-    const cfg      = loadConfig();
-    const strategy = "trend_range_fork" as const;
-    const trigger  = this.trigger;
-    const deps     = this.deps;
-    const userKey  = this.userKey;
+    const cfg          = loadConfig();
+    const strategyMode = this.strategyMode;
+    const strategy     = strategyMode;  // alias for emit events
+    const strategyImpl = STRATEGY_MAP[strategyMode] ?? STRATEGY_MAP.trend_range_fork;
+    const trigger      = this.trigger;
+    const deps         = this.deps;
+    const userKey      = this.userKey;
 
     // Attach strategy / trigger so botWorker can read them via deps
-    (deps as any).strategy = strategy;
+    (deps as any).strategy = strategyMode;
     (deps as any).trigger  = trigger;
+
+    // Override timeframes from strategy defaults if not set in bot.config.json
+    const strategyDefaultTFs = strategyImpl.defaultTimeframes as readonly string[];
+    if (!cfg.TIMEFRAMES?.length) (cfg as any).TIMEFRAMES = strategyDefaultTFs;
 
     // ── Symbol validation ────────────────────────────────────────────────────
     const requested = this.symbols.map(s => String(s).trim().toUpperCase()).filter(Boolean);
@@ -292,12 +352,12 @@ export class BotWorkerInstance {
     }
 
     // ── State restore from Redis ─────────────────────────────────────────────
-    log.info({ userKey, symbols: valid }, "[botWorkerInstance] restoring state from Redis");
-    await restoreState(deps.redis, userKey, valid);
+    log.info({ userKey, symbols: valid, strategy: strategyMode }, "[botWorkerInstance] restoring state from Redis");
+    await strategyImpl.restore(deps.redis, userKey, valid);
 
     // ── On-chain position recovery ───────────────────────────────────────────
     log.info({ userKey }, "[botWorkerInstance] recovering on-chain positions");
-    await recoverOpenPositions(userKey, valid, cfg.DEFAULT_LEVERAGE ?? 10, deps);
+    await recoverOpenPositions(userKey, valid, cfg.DEFAULT_LEVERAGE ?? 10, deps, strategyImpl.register);
 
     this.startedAt = Date.now();
 
@@ -403,14 +463,15 @@ export class BotWorkerInstance {
         },
       };
 
-      // Scan all symbols — regime TFs first (1h), then entry TF (5m)
-      const ENTRY_TF  = "5m";
-      const regimeTfs = cfg.TIMEFRAMES.filter((tf: string) => tf !== ENTRY_TF);
-      const hasEntry  = cfg.TIMEFRAMES.includes(ENTRY_TF);
+      // Scan all symbols — use strategy-specific timeframes
+      const tfs     = (cfg.TIMEFRAMES as string[]) ?? strategyDefaultTFs;
+      const ENTRY_TF  = tfs[tfs.length - 1] ?? "5m"; // last TF is the entry timeframe
+      const regimeTfs = tfs.slice(0, -1);
+      const hasEntry  = true; // always scan entry TF
 
       const scanOne = async (tf: string, sym: string) => {
         try {
-          await evalTrendRangeFork(scanDeps as any, { userKey, symbol: sym, timeframe: tf });
+          await strategyImpl.eval(scanDeps as any, { userKey, symbol: sym, timeframe: tf });
         } catch (e: any) {
           deps.emit({
             ts: Date.now(), type: "SCAN_ERROR",
@@ -456,7 +517,7 @@ export class BotWorkerInstance {
         }
 
         if (hasTxHash && !(result as any)?.paper) {
-          registerTradeAfterExecution({
+          strategyImpl.register({
             userKey:       best.userKey,
             symbol:        best.symbol,
             timeframe:     best.timeframe,
@@ -492,7 +553,7 @@ export class BotWorkerInstance {
         const price = getLatestPrice(sym);
         if (price == null) continue;
         try {
-          await fastExitCheck(userKey, sym, price, deps);
+          await strategyImpl.fastExit(userKey, sym, price, deps);
         } catch {
           // Suppress — 10s scanner is the fallback
         }
@@ -526,6 +587,7 @@ export class BotWorkerInstance {
       uptimeMs:   this.startedAt ? Date.now() - this.startedAt : 0,
       symbols:    this.validSymbols,
       dropped:    this.dropped,
+      strategy:   this.strategyMode,
     };
   }
 }
