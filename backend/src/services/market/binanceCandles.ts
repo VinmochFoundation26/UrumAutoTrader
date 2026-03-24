@@ -111,6 +111,12 @@ export async function getUsdmFuturesSymbols(args?: {
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
+    // 451 = geo-restricted location — skip validation, accept all symbols
+    if (res.status === 451) {
+      cachedSymbols = new Set(["__GEO_BYPASS__"]);
+      cachedAt = now;
+      return cachedSymbols;
+    }
     throw new Error(`Binance FAPI exchangeInfo HTTP ${res.status}: ${body.slice(0, 200)}`);
   }
 
@@ -129,6 +135,8 @@ export async function getUsdmFuturesSymbols(args?: {
 
 export async function assertUsdmSymbol(symbol: string) {
   const set = await getUsdmFuturesSymbols();
+  // "__GEO_BYPASS__" sentinel means exchangeInfo is geo-restricted — skip validation
+  if (set.has("__GEO_BYPASS__")) return;
   if (!set.has(symbol)) throw new Error(`Symbol not found on USD-M Futures: ${symbol}`);
 }
 
