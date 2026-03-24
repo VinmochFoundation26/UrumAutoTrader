@@ -32,18 +32,44 @@ const store: Store = {
 };
 
 // ── SSE subscribers ───────────────────────────────────────────────────────────
+// Map from userKey → set of SSE responses.
+// Use "*" for admin/all-events subscribers that receive every event.
 
-const sseClients = new Set<http.ServerResponse>();
+const sseClients = new Map<string, Set<http.ServerResponse>>();
 
-export function addSseClient(res: http.ServerResponse) {
-  sseClients.add(res);
-  res.on("close", () => sseClients.delete(res));
+export function addSseClient(res: http.ServerResponse, userKey: string = "*") {
+  let set = sseClients.get(userKey);
+  if (!set) {
+    set = new Set();
+    sseClients.set(userKey, set);
+  }
+  set.add(res);
+  res.on("close", () => {
+    set!.delete(res);
+    if (set!.size === 0) sseClients.delete(userKey);
+  });
 }
 
 function broadcastSse(event: BotEvent) {
   const data = `data: ${JSON.stringify(event)}\n\n`;
-  for (const res of sseClients) {
-    try { res.write(data); } catch { sseClients.delete(res); }
+
+  // Send to the specific user's clients (if event has a userKey)
+  const eventUserKey: string | undefined = event?.userKey;
+  if (eventUserKey) {
+    const userSet = sseClients.get(eventUserKey);
+    if (userSet) {
+      for (const res of userSet) {
+        try { res.write(data); } catch { userSet.delete(res); }
+      }
+    }
+  }
+
+  // Always send to admin "*" clients
+  const adminSet = sseClients.get("*");
+  if (adminSet) {
+    for (const res of adminSet) {
+      try { res.write(data); } catch { adminSet.delete(res); }
+    }
   }
 }
 
@@ -110,8 +136,11 @@ export function getState() {
   return store;
 }
 
-export function getEventHistory() {
-  return store.eventHistory;
+export function getEventHistory(userKey?: string) {
+  if (!userKey || userKey === "*") return store.eventHistory;
+  return store.eventHistory.filter(
+    (e) => e?.userKey === userKey || e?.userKey === undefined
+  );
 }
 
 /**

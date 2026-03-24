@@ -205,7 +205,9 @@ let lastRun:
   | null = null;
 
 /**
- * Engine start (owned by index.ts)
+ * @deprecated Use workerPool.startUser() via POST /pool/start instead.
+ * This function manages a single global timer and is not safe for concurrent users.
+ * Kept for backward compatibility only.
  */
 export async function startEngine(args: {
   userKey: string;
@@ -698,7 +700,9 @@ try {
 }
 
 /**
- * Engine stop (owned by index.ts)
+ * @deprecated Use workerPool.startUser() via POST /pool/start instead.
+ * This function manages a single global timer and is not safe for concurrent users.
+ * Kept for backward compatibility only.
  */
 export function stopEngine() {
   if (timer) clearInterval(timer);

@@ -3,6 +3,8 @@
 // Klines: GET /fapi/v1/klines
 // ExchangeInfo: GET /fapi/v1/exchangeInfo
 
+import { acquireCandleToken } from "./candleRateLimiter.js";
+
 type BinanceKline = [
   number, string, string, string, string, string,
   number, string, number, string, string, string
@@ -226,6 +228,8 @@ export async function fetchBinanceOHLCV(args: {
     `&interval=${encodeURIComponent(interval)}` +
     `&limit=${limit}`;
 
+  // Acquire rate limiter token before real network call
+  await acquireCandleToken();
   const res = await fetchWithTimeout(url, { timeoutMs, retries, backoffBaseMs: 250 });
 
   if (!res.ok) {

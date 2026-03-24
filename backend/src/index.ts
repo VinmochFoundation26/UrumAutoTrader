@@ -76,6 +76,8 @@ setInterval(() => {
   for (const [k, v] of _rlMap) if (now > v.resetAt) _rlMap.delete(k);
 }, 5 * 60_000).unref();
 
+// @deprecated — global mutable user address. Use JWT-derived userKey or ?user= param.
+// Will be removed once all routes migrate to resolveUserKey().
 // Prefer TEST_USER_ADDRESS, but keep TEST_USER_KEY for backward compatibility
 let currentUserAddress = process.env.TEST_USER_ADDRESS ?? process.env.TEST_USER_KEY ?? "";
 
@@ -180,6 +182,33 @@ async function auditLog(adminId: string, action: string, targetUserId: string, d
     await getRedis().lpush("audit:log", entry);
     await getRedis().ltrim("audit:log", 0, 9999);
   } catch { /* non-fatal */ }
+}
+
+/**
+ * Resolves the active userKey for a request using priority:
+ *   1. ?user= query param (allowed for admin only in production)
+ *   2. JWT-derived wallet address from the authenticated user record
+ *   3. currentUserAddress fallback (deprecated)
+ */
+async function resolveUserKey(
+  req: http.IncomingMessage,
+  u: URL
+): Promise<string> {
+  // 1. Query param
+  const q = u.searchParams.get("user");
+  if (q) return q;
+
+  // 2. JWT
+  try {
+    const payload = decodeToken(req);
+    if (payload?.userId) {
+      const user = await getUserById(getRedis(), payload.userId).catch(() => null);
+      if (user?.walletAddress) return user.walletAddress;
+    }
+  } catch { /* non-fatal */ }
+
+  // 3. Fallback
+  return currentUserAddress;
 }
 
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
@@ -630,8 +659,9 @@ http
 
       if (u.pathname === "/bot/config") {
         if (req.method === "GET" || req.method === "HEAD") {
+          const userKey = await resolveUserKey(req, u);
           return json(res, 200, {
-            userAddress: currentUserAddress,
+            userAddress: userKey,
             symbols: currentSymbols,
             strategy: currentStrategy,
             trigger: currentTrigger,
@@ -718,9 +748,10 @@ http
         try {
           const b = await readJson(req);
           const redis = getRedis();
+          const userKey = await resolveUserKey(req, u);
           // Load existing user config, merge, validate, save
           const existing = await (async () => {
-            try { const s = await redis.get(CFG_KEYS.user(currentUserAddress)); return s ? JSON.parse(s) : {}; }
+            try { const s = await redis.get(CFG_KEYS.user(userKey)); return s ? JSON.parse(s) : {}; }
             catch { return {}; }
           })();
           const merged = { ...existing, ...b };
@@ -731,7 +762,7 @@ http
             if (validated.DEFAULT_LEVERAGE > cap) validated.DEFAULT_LEVERAGE = cap;
             if (validated.MAX_LEVERAGE > cap) validated.MAX_LEVERAGE = cap;
           }
-          await redis.set(CFG_KEYS.user(currentUserAddress), JSON.stringify(validated));
+          await redis.set(CFG_KEYS.user(userKey), JSON.stringify(validated));
           log.info({ leverage: validated.DEFAULT_LEVERAGE, manualSizePct: validated.MANUAL_SIZE_PCT }, "[config] user bot config saved");
           return json(res, 200, { ok: true, config: validated });
         } catch (e: any) {
@@ -739,9 +770,14 @@ http
         }
       }
 
+      // @deprecated — migrate to POST /pool/start. This route uses the global
+      // currentUserAddress and is not safe for multi-user operation.
       if (u.pathname === "/bot/start") {
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
+        res.setHeader("Deprecation", "true");
+        res.setHeader("Sunset", "2026-12-31");
+        log.warn("[DEPRECATED] POST /bot/start — migrate to POST /pool/start");
         if (!currentUserAddress) return json(res, 400, { ok: false, error: "Set TEST_USER_ADDRESS env or POST /bot/set" });
         currentSymbols = normalizeSymbols(currentSymbols);
         if (!currentSymbols.length) return json(res, 400, { ok: false, error: "no valid symbols configured" });
@@ -772,9 +808,14 @@ http
         return json(res, 200, r);
       }
 
+      // @deprecated — migrate to POST /pool/stop. This route uses the global
+      // currentUserAddress and is not safe for multi-user operation.
       if (u.pathname === "/bot/stop") {
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
+        res.setHeader("Deprecation", "true");
+        res.setHeader("Sunset", "2026-12-31");
+        log.warn("[DEPRECATED] POST /bot/stop — migrate to POST /pool/stop");
         const r = stopBot();
         setRunning(false);
         await persistEngineState(false);  // clear autostart flag
@@ -866,7 +907,7 @@ http
         const jwtErr      = requireAuth(req);
         if (adminKeyErr !== null && jwtErr !== null) return json(res, 401, { ok: false, error: "unauthorized" });
         try {
-          const user = currentUserAddress;
+          const user = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
           const readC  = getVaultReadContract();
           const markets: string[] = await readC.getOpenMarkets(user);
@@ -924,7 +965,7 @@ http
           const symbol: string | undefined = b?.symbol?.toUpperCase();
           if (!symbol) return json(res, 400, { ok: false, error: "symbol required" });
 
-          const user = currentUserAddress;
+          const user = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           const { symbolToMarketId } = await import("./services/onchain/vaultAdapter.js");
@@ -958,9 +999,29 @@ http
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
-        addSseClient(res);
+
+        // Determine userKey for filtering:
+        // 1. Admin/support role → use "*" (all events) or ?userKey= param
+        // 2. User role → derive from JWT-linked wallet address
+        // 3. No token → fallback to currentUserAddress (backward compat)
+        let sseUserKey: string = currentUserAddress || "*";
+        const ssePayload = decodeToken(req);
+        if (ssePayload?.userId) {
+          if (ssePayload.role === "admin" || ssePayload.role === "support") {
+            // Admin sees all, but can filter via ?userKey=
+            sseUserKey = u.searchParams.get("userKey") ?? "*";
+          } else {
+            // Regular user: look up wallet address from user record
+            try {
+              const sseUser = await getUserById(getRedis(), ssePayload.userId).catch(() => null);
+              sseUserKey = sseUser?.walletAddress || currentUserAddress || "*";
+            } catch { /* non-fatal — fall back to currentUserAddress */ }
+          }
+        }
+
+        addSseClient(res, sseUserKey);
         // Send recent history so client is immediately populated
-        const history = getEventHistory();
+        const history = getEventHistory(sseUserKey);
         for (const e of history) res.write(`data: ${JSON.stringify(e)}\n\n`);
         // Keep alive ping every 15s
         const ping = setInterval(() => {
@@ -1040,7 +1101,8 @@ http
         const { loadClosedTrades } = await import("./services/cache/tradeCache.js");
         const { getRedis } = await import("./services/cache/redis.js");
         const limit = Math.min(Number(u.searchParams.get("limit") ?? "200"), 2000);
-        const trades = await loadClosedTrades(getRedis(), currentUserAddress, limit);
+        const userKey = await resolveUserKey(req, u);
+        const trades = await loadClosedTrades(getRedis(), userKey, limit);
         // Also compute summary metrics over all closed trades
         const { computeMetrics } = await import("./services/backtest/metrics.js");
         const metrics = computeMetrics(
@@ -1097,8 +1159,9 @@ http
       if (u.pathname === "/bot/risk") {
         const { checkCircuitBreaker, getDailyReturn } = await import("./services/bot/drawdownGuard.js");
         const maxLoss    = Math.abs(Number(process.env.MAX_DAILY_LOSS_PCT ?? "0.10"));
-        const cb         = await checkCircuitBreaker(getRedis(), currentUserAddress, maxLoss);
-        const dailyReturn = await getDailyReturn(getRedis(), currentUserAddress);
+        const userKey    = await resolveUserKey(req, u);
+        const cb         = await checkCircuitBreaker(getRedis(), userKey, maxLoss);
+        const dailyReturn = await getDailyReturn(getRedis(), userKey);
         return json(res, 200, {
           ok: true,
           dailyReturn,
@@ -1118,7 +1181,8 @@ http
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
         const { resetCircuitBreaker } = await import("./services/bot/drawdownGuard.js");
-        await resetCircuitBreaker(getRedis(), currentUserAddress);
+        const userKey = await resolveUserKey(req, u);
+        await resetCircuitBreaker(getRedis(), userKey);
         return json(res, 200, { ok: true, message: "Circuit breaker reset for today" });
       }
 
@@ -1576,7 +1640,8 @@ http
             // what was saved in Redis (e.g. after a symbol swap via dashboard/Redis).
             updateStreamSymbols(currentSymbols);
             log.info({ symbols: currentSymbols }, "[server] auto-resuming engine after restart");
-            await startBot({ userKey: s.userKey, symbols: currentSymbols, trigger: currentTrigger });
+            // Use workerPool.startUser() for multi-user safe restart
+            await workerPool.startUser({ userKey: s.userKey, symbols: currentSymbols, trigger: currentTrigger, skipSubCheck: true });
             setRunning(true);
           }
         }
