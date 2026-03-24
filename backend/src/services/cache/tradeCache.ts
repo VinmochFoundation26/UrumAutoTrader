@@ -213,6 +213,10 @@ export async function appendClosedTrade(
     durationMs: number;
     reason:     string;
     closedAt:   number;
+    // optional extended fields (new strategies)
+    timeframe?:  string;
+    strategy?:   string;
+    openedAtMs?: number;
   },
 ): Promise<void> {
   try {
