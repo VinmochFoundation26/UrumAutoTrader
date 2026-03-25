@@ -760,6 +760,9 @@ http
             userId:        userId  || undefined,
             skipSubCheck:  !userId,   // skip if no userId provided (admin override)
           });
+          if (r.ok) {
+            await getRedis().set("bot:engine:autostart", JSON.stringify({ running: true, userKey, symbols, trigger, strategy }));
+          }
           await auditLog(adminResult.userId, "pool:start", userKey, `symbols=${symbols.join(",")}`);
           return json(res, r.ok ? 200 : 400, r);
         } catch (e: any) {
@@ -777,6 +780,7 @@ http
           if (!userKey) return json(res, 400, { ok: false, error: "userKey required" });
 
           const r = workerPool.stopUser(userKey);
+          await getRedis().del("bot:engine:autostart");
           await auditLog(adminResult.userId, "pool:stop", userKey);
           return json(res, 200, r);
         } catch (e: any) {
@@ -1018,6 +1022,7 @@ http
         const { getRedis } = await import("./services/cache/redis.js");
         const limit = Math.min(Number(u.searchParams.get("limit") ?? "200"), 2000);
         const userKey = await resolveUserKey(req, u);
+        if (!userKey) return json(res, 401, { ok: false, error: "authentication required" });
         const trades = await loadClosedTrades(getRedis(), userKey, limit);
         // Also compute summary metrics over all closed trades
         const { computeMetrics } = await import("./services/backtest/metrics.js");
@@ -1076,6 +1081,7 @@ http
         const { checkCircuitBreaker, getDailyReturn } = await import("./services/bot/drawdownGuard.js");
         const maxLoss    = Math.abs(Number(process.env.MAX_DAILY_LOSS_PCT ?? "0.10"));
         const userKey    = await resolveUserKey(req, u);
+        if (!userKey) return json(res, 401, { ok: false, error: "authentication required" });
         const cb         = await checkCircuitBreaker(getRedis(), userKey, maxLoss);
         const dailyReturn = await getDailyReturn(getRedis(), userKey);
         return json(res, 200, {
@@ -1098,6 +1104,7 @@ http
         if (err) return json(res, 401, { ok: false, error: err });
         const { resetCircuitBreaker } = await import("./services/bot/drawdownGuard.js");
         const userKey = await resolveUserKey(req, u);
+        if (!userKey) return json(res, 401, { ok: false, error: "authentication required" });
         await resetCircuitBreaker(getRedis(), userKey);
         return json(res, 200, { ok: true, message: "Circuit breaker reset for today" });
       }
@@ -1533,6 +1540,30 @@ http
 
       // 4. Verify on-chain connection
       await assertOnchainReady();
+
+      // 5. Auto-restart engine if it was running before crash/restart
+      try {
+        const redis = getRedis();
+        const saved = await redis.get("bot:engine:autostart");
+        if (saved) {
+          const s = JSON.parse(saved);
+          if (s.running && s.userKey) {
+            if (Array.isArray(s.symbols) && s.symbols.length) currentSymbols = s.symbols;
+            if (s.trigger) currentTrigger = s.trigger;
+            updateStreamSymbols(currentSymbols);
+            log.info({ userKey: s.userKey, symbols: currentSymbols }, "[server] auto-resuming engine after restart");
+            await workerPool.startUser({
+              userKey: s.userKey,
+              symbols: currentSymbols,
+              trigger: currentTrigger,
+              strategy: s.strategy ?? "trend_range_fork",
+              skipSubCheck: true,
+            });
+          }
+        }
+      } catch (e: any) {
+        log.warn({ err: e?.message }, "[server] auto-restart check failed (non-fatal)");
+      }
 
       log.info({ port: PORT, symbols: currentSymbols }, "[server] ready ✓");
     } catch (e: any) {
