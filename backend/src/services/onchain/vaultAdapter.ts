@@ -487,12 +487,29 @@ export async function withdrawStableFromVault(
   userAddress: string,
   amountRaw: bigint
 ) {
+  const wallet = signer as Wallet;
   const c = vault.connect(signer);
-  // Step 1 — initiate
-  const initTx = await (c as any).initiateWithdrawStable(amountRaw);
+
+  // Step 1 — initiate (serialised through nonce manager)
+  const [initNonce, initGas] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+  const initOverrides: Record<string, any> = { ...initGas };
+  if (initNonce !== undefined) initOverrides.nonce = initNonce;
+
+  const initTx = await (c as any).initiateWithdrawStable(amountRaw, initOverrides);
   const initReceipt = await waitWithFallback(initTx);
-  // Step 2 — approve (bot is WITHDRAW_APPROVER_ROLE — completes immediately)
-  const approveTx = await (c as any).approveWithdrawStable(userAddress, amountRaw);
+
+  // Step 2 — approve (bot is WITHDRAW_APPROVER_ROLE — allocate next nonce)
+  const [approveNonce, approveGas] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+  const approveOverrides: Record<string, any> = { ...approveGas };
+  if (approveNonce !== undefined) approveOverrides.nonce = approveNonce;
+
+  const approveTx = await (c as any).approveWithdrawStable(userAddress, amountRaw, approveOverrides);
   const approveReceipt = await waitWithFallback(approveTx);
   return { initTxHash: initReceipt.hash, txHash: approveReceipt.hash, receipt: approveReceipt };
 }
@@ -508,8 +525,17 @@ export async function emergencyWithdrawFromVault(
   signer: Signer,
   amountGrossRaw: bigint
 ) {
+  const wallet = signer as Wallet;
   const c = vault.connect(signer);
-  const tx = await (c as any).emergencyWithdrawStable(amountGrossRaw);
+
+  const [nonce, gasParams] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+  const overrides: Record<string, any> = { ...gasParams };
+  if (nonce !== undefined) overrides.nonce = nonce;
+
+  const tx = await (c as any).emergencyWithdrawStable(amountGrossRaw, overrides);
   const receipt = await waitWithFallback(tx);
   return { txHash: receipt.hash, receipt };
 }
