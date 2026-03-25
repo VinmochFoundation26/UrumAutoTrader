@@ -411,8 +411,16 @@ export async function transferUsdcFee(
   if (feeRaw === 0n) return null;
 
   try {
+    const wallet = signer as Wallet;
+    const [nonce, gasParams] = await Promise.all([
+      wallet ? getNonce(wallet) : Promise.resolve(undefined),
+      getEip1559Params(getProvider()),
+    ]);
+    const overrides: Record<string, any> = { ...gasParams };
+    if (nonce !== undefined) overrides.nonce = nonce;
+
     const stable = new Contract(stableAddr, ERC20_ABI, signer);
-    const tx = await (stable as any).transfer(feeWallet, feeRaw);
+    const tx = await (stable as any).transfer(feeWallet, feeRaw, overrides);
     const receipt = await waitWithFallback(tx);
     log.info({ label, feeRaw: feeRaw.toString(), feeWallet, txHash: receipt.hash },
       "[vaultAdapter] platform fee transferred ✓");
@@ -436,13 +444,30 @@ export async function depositStableToVault(
   vaultAddr: string,
   amountRaw: bigint
 ) {
+  const wallet = signer as Wallet;
   const stable = new Contract(stableAddr, ERC20_ABI, signer);
-  // 1. Approve vault to spend tokens
-  const approveTx = await (stable as any).approve(vaultAddr, amountRaw);
+
+  // 1. Approve vault to spend tokens — serialised through nonce manager
+  const [approveNonce, gasParams] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+  const approveOverrides: Record<string, any> = { ...gasParams };
+  if (approveNonce !== undefined) approveOverrides.nonce = approveNonce;
+
+  const approveTx = await (stable as any).approve(vaultAddr, amountRaw, approveOverrides);
   await waitWithFallback(approveTx);
-  // 2. Deposit into vault
+
+  // 2. Deposit into vault — allocate next nonce after approve
+  const [depositNonce, depositGas] = await Promise.all([
+    wallet ? getNonce(wallet) : Promise.resolve(undefined),
+    getEip1559Params(getProvider()),
+  ]);
+  const depositOverrides: Record<string, any> = { ...depositGas };
+  if (depositNonce !== undefined) depositOverrides.nonce = depositNonce;
+
   const vaultConnected = vault.connect(signer);
-  const depositTx = await (vaultConnected as any).depositStable(amountRaw);
+  const depositTx = await (vaultConnected as any).depositStable(amountRaw, depositOverrides);
   const receipt = await waitWithFallback(depositTx);
   return { txHash: receipt.hash, receipt };
 }
