@@ -637,6 +637,9 @@ http
 
       if (u.pathname === "/bot/state") {
         const userKey = await resolveUserKey(req, u);
+        const baseState = getState();
+        const workerRunning = userKey ? workerPool.isRunning(userKey) : false;
+        const workerStatus  = userKey ? workerPool.getUserStatus(userKey) : null;
         return json(res, 200, {
           ok: true,
           config: {
@@ -645,7 +648,11 @@ http
             strategy: currentStrategy,
             trigger: currentTrigger,
           },
-          state: getState(),
+          state: {
+            ...baseState,
+            running:   workerRunning,
+            startedAt: workerStatus?.startedAt ?? baseState.startedAt,
+          },
         });
       }
 
