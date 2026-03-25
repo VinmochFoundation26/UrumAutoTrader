@@ -736,6 +736,48 @@ http
         }
       }
 
+      // ── POST /bot/start — start bot for current authenticated user ────────
+      if (u.pathname === "/bot/start" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const userKey = await resolveUserKey(req, u);
+          if (!userKey) return json(res, 400, { ok: false, error: "user not authenticated" });
+          const payload  = decodeToken(req);
+          const userId   = payload?.userId as string | undefined;
+          const r = await workerPool.startUser({
+            userKey,
+            symbols:  currentSymbols,
+            trigger:  currentTrigger,
+            strategy: currentStrategy,
+            userId,
+          });
+          if (r.ok) {
+            await getRedis().set("bot:engine:autostart", JSON.stringify({
+              running: true, userKey, symbols: currentSymbols, trigger: currentTrigger, strategy: currentStrategy,
+            }));
+          }
+          return json(res, r.ok ? 200 : 400, r);
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      // ── POST /bot/stop — stop bot for current authenticated user ─────────
+      if (u.pathname === "/bot/stop" && req.method === "POST") {
+        const err = requireAuth(req);
+        if (err) return json(res, 401, { ok: false, error: err });
+        try {
+          const userKey = await resolveUserKey(req, u);
+          if (!userKey) return json(res, 400, { ok: false, error: "user not authenticated" });
+          const r = workerPool.stopUser(userKey);
+          await getRedis().del("bot:engine:autostart");
+          return json(res, 200, r);
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
       // ── POST /pool/start — start bot for a specific user (admin) ─────────
       if (u.pathname === "/pool/start" && req.method === "POST") {
         const adminResult = await requireAdminRole(req);
