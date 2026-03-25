@@ -1185,8 +1185,11 @@ http
             readC.emergencyFeeBps() as Promise<bigint>,
           ]);
 
-          // Wallet balance (raw USDC in wallet, not yet deposited)
-          const wallet = await getWalletStableBalance(getProvider(), stableAddr, user, STABLE_DECIMALS);
+          // Wallet balance — shows the bot signer's USDC balance, since deposit
+          // uses the bot signer wallet (getSigner()) to approve + depositStable.
+          // User must first transfer USDC to the bot signer address before depositing.
+          const signerAddress = getSigner().address;
+          const wallet = await getWalletStableBalance(getProvider(), stableAddr, signerAddress, STABLE_DECIMALS);
 
           const BPS_DENOM = 10_000n;
           const fmtX18 = (x: bigint) => +(Number(x) / 1e18).toFixed(2);
