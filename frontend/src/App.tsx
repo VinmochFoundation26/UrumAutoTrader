@@ -2672,7 +2672,7 @@ export default function App() {
           EXIT_ON_PROFIT_REVERSAL: 0.03,
         }),
       });
-      await apiFetch("/bot/start");
+      await apiFetch("/bot/start", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
@@ -2680,7 +2680,7 @@ export default function App() {
   async function handleStop() {
     setActionLoading(true);
     try {
-      await apiFetch("/bot/stop");
+      await apiFetch("/bot/stop", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
