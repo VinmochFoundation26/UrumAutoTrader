@@ -637,6 +637,9 @@ http
 
       if (u.pathname === "/bot/state") {
         const userKey = await resolveUserKey(req, u);
+        const baseState = getState();
+        const workerRunning = userKey ? workerPool.isRunning(userKey) : false;
+        const workerStatus  = userKey ? workerPool.getUserStatus(userKey) : null;
         return json(res, 200, {
           ok: true,
           config: {
@@ -645,7 +648,11 @@ http
             strategy: currentStrategy,
             trigger: currentTrigger,
           },
-          state: getState(),
+          state: {
+            ...baseState,
+            running:   workerRunning,
+            startedAt: workerStatus?.startedAt ?? baseState.startedAt,
+          },
         });
       }
 
@@ -741,8 +748,7 @@ http
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
         try {
-          const userKey = await resolveUserKey(req, u);
-          if (!userKey) return json(res, 400, { ok: false, error: "user not authenticated" });
+          const userKey = (await resolveUserKey(req, u)) || getSigner().address;
           const payload  = decodeToken(req);
           const userId   = payload?.userId as string | undefined;
           const r = await workerPool.startUser({
@@ -768,8 +774,7 @@ http
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
         try {
-          const userKey = await resolveUserKey(req, u);
-          if (!userKey) return json(res, 400, { ok: false, error: "user not authenticated" });
+          const userKey = (await resolveUserKey(req, u)) || getSigner().address;
           const r = workerPool.stopUser(userKey);
           await getRedis().del("bot:engine:autostart");
           return json(res, 200, r);
