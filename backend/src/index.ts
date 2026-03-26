@@ -748,8 +748,7 @@ http
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
         try {
-          const userKey = await resolveUserKey(req, u);
-          if (!userKey) return json(res, 400, { ok: false, error: "user not authenticated" });
+          const userKey = (await resolveUserKey(req, u)) || getSigner().address;
           const payload  = decodeToken(req);
           const userId   = payload?.userId as string | undefined;
           const r = await workerPool.startUser({
@@ -775,8 +774,7 @@ http
         const err = requireAuth(req);
         if (err) return json(res, 401, { ok: false, error: err });
         try {
-          const userKey = await resolveUserKey(req, u);
-          if (!userKey) return json(res, 400, { ok: false, error: "user not authenticated" });
+          const userKey = (await resolveUserKey(req, u)) || getSigner().address;
           const r = workerPool.stopUser(userKey);
           await getRedis().del("bot:engine:autostart");
           return json(res, 200, r);
