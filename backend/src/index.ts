@@ -170,11 +170,7 @@ async function resolveUserKey(
     const payload = decodeToken(req);
     if (payload?.userId) {
       const user = await getUserById(getRedis(), payload.userId).catch(() => null);
-      VinmochFoundation26-patch-2
       if (user?.walletAddress) return user.walletAddress.toLowerCase();
-      
-     if (user?.walletAddress) return user.walletAddress.toLowerCase();
-      main
     }
   } catch { /* non-fatal */ }
 
