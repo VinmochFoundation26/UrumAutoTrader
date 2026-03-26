@@ -163,14 +163,14 @@ async function resolveUserKey(
 ): Promise<string> {
   // 1. Query param
   const q = u.searchParams.get("user");
-  if (q) return q;
+  if (q) return q.toLowerCase();
 
   // 2. JWT
   try {
     const payload = decodeToken(req);
     if (payload?.userId) {
       const user = await getUserById(getRedis(), payload.userId).catch(() => null);
-      if (user?.walletAddress) return user.walletAddress;
+      if (user?.walletAddress) return user.walletAddress.toLowerCase();
     }
   } catch { /* non-fatal */ }
 
