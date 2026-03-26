@@ -365,11 +365,16 @@ export class BotWorkerInstance {
     this.timer = setInterval(async () => {
 
       // ── Circuit breaker ────────────────────────────────────────────────────
+      // When triggered: block NEW entries only — exit monitoring still runs to
+      // protect existing open positions. Returning here would leave open positions
+      // without stop-loss coverage until midnight, which is worse than the loss.
+      let circuitBreakerActive = false;
       if (deps.redis) {
         try {
           const maxLoss = Math.abs(Number(process.env.MAX_DAILY_LOSS_PCT ?? "0.10"));
           const cb      = await checkCircuitBreaker(deps.redis, userKey, maxLoss);
           if (cb.triggered) {
+            circuitBreakerActive = true;
             if (this.lastCircuitBreakerDate !== cb.date) {
               this.lastCircuitBreakerDate = cb.date;
               deps.emit({
@@ -378,7 +383,7 @@ export class BotWorkerInstance {
                 reason: `Daily levered loss ${(cb.dailyReturn * 100).toFixed(1)}% exceeded limit ${(cb.limit * 100).toFixed(1)}%`,
               });
             }
-            return; // skip tick — engine stays alive, auto-resumes at UTC midnight
+            // Do NOT return — fall through so exit checks still run for open positions
           }
         } catch (e: any) {
           log.warn({ err: e?.message, userKey }, "[botWorkerInstance] circuit breaker check failed (non-fatal)");
@@ -502,7 +507,7 @@ export class BotWorkerInstance {
         votes: best.votes, strategy,
       });
 
-      if (atCapacity) return;
+      if (atCapacity || circuitBreakerActive) return;
 
       // ── EXECUTE BEST ──────────────────────────────────────────────────────
       try {
