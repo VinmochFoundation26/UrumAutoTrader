@@ -3,7 +3,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import subprocess, os
 
 TOKEN = os.environ.get('DEPLOY_TOKEN', '')
-REPO  = '/home/user/UrumAutoTrader'
+REPO  = '/root/UrumAutoTrader'
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
