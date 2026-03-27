@@ -1478,7 +1478,11 @@ export async function evaluateUserSymbol(
           emit(deps, { type: "GHOST_TRADE_CLEARED", userKey, symbol, timeframe });
           return;
         }
-        throw closeErr; // re-throw all other errors (tx failure, network, etc.)
+        // Close failed (tx error, network, etc.) — reset closing flag so the
+        // next scan tick retries.  Without this reset, t.closing stays true
+        // permanently and the exit block is skipped on every future tick.
+        t.closing = false;
+        throw closeErr;
       }
 
       // Capture PnL before deleting (for performance history)
