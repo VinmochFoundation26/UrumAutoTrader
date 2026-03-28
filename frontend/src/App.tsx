@@ -197,6 +197,7 @@ function eventColor(type: string): string {
   if (type === "POSITION_RECOVERED") return "var(--blue)";
   if (type === "GHOST_TRADE_CLEARED") return "var(--orange)";
   if (type === "EXIT_SIGNAL") return "var(--blue)";
+  if (type === "TRAIL_STATUS") return "var(--orange)";
   if (type === "CIRCUIT_BREAKER_TRIGGERED") return "var(--red)";
   if (type.includes("CLOSED") || type.includes("EXIT")) return "var(--blue)";
   if (type.includes("FAILED") || type.includes("ERROR")) return "var(--red)";
@@ -211,6 +212,7 @@ function eventIcon(type: string) {
   if (type === "POSITION_RECOVERED") return "🔄";
   if (type === "GHOST_TRADE_CLEARED") return "👻";
   if (type === "EXIT_SIGNAL") return "🔵";
+  if (type === "TRAIL_STATUS") return "🟠";
   if (type === "CIRCUIT_BREAKER_TRIGGERED") return "🚨";
   if (type.includes("CLOSED") || type.includes("EXIT")) return "🔵";
   if (type.includes("FAILED") || type.includes("ERROR")) return "🔴";
@@ -400,6 +402,15 @@ function EventRow({ e }: { e: BotEvent }) {
       {e.type === "ATR_BLOCKED" && e.atrPct != null && (
         <span className="event-votes" style={{ color: "var(--orange)" }}>
           ATR {(e.atrPct * 100).toFixed(3)}%
+        </span>
+      )}
+      {e.type === "TRAIL_STATUS" && (
+        <span className="event-votes" style={{ color: "var(--orange)" }}>
+          lev {Number(e.currentLevPnlPct ?? 0).toFixed(1)}%
+          {" / "}best {Number(e.bestLevPnlPct ?? 0).toFixed(1)}%
+          {" / "}floor {e.effectiveStopLevPct == null ? "—" : `${Number(e.effectiveStopLevPct).toFixed(1)}%`}
+          {e.miniGateArmed ? " / mini" : ""}
+          {e.majorGateLocked ? " / major" : ""}
         </span>
       )}
       {e.result?.txHash && (
@@ -2644,7 +2655,7 @@ export default function App() {
           const next = [...prev, ev];
           if (next.length <= 100) return next;
           // Always preserve critical events so they are never scrolled off by VOTES noise.
-          const critical = new Set(["TRADE_EXECUTED","BEST_ENTRY","CANDIDATE_FOUND","POSITION_CLOSED","CIRCUIT_BREAKER_TRIGGERED","POSITION_RECOVERED","GHOST_TRADE_CLEARED","EXIT_SIGNAL","MAX_HOLD_EXIT"]);
+          const critical = new Set(["TRADE_EXECUTED","BEST_ENTRY","CANDIDATE_FOUND","POSITION_CLOSED","CIRCUIT_BREAKER_TRIGGERED","POSITION_RECOVERED","GHOST_TRADE_CLEARED","EXIT_SIGNAL","MAX_HOLD_EXIT","TRAIL_STATUS"]);
           const routine = next.filter(x => !critical.has(x.type));
           const important = next.filter(x => critical.has(x.type));
           // Keep last 10 critical events + last 90 routine events = 100 total

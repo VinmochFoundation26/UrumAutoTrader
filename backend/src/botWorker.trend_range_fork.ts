@@ -301,11 +301,33 @@ type ActiveTrade = {
   pendingBestWad: Wad;  // candidate new high seen on LAST kline tick; promoted to bestPriceWad
                         // only when the NEXT tick confirms the price is still at/above it.
                         // Prevents micro-spikes (< 10s) from locking in a false gate floor.
+  pendingBestSeenAtMs: number;
   sizeWad: Wad;
   openedAtMs: number;
   pending: boolean;
   closing: boolean; // true once exit is in-flight — prevents double-close from fast monitor + scanner
 };
+
+export type TrendExitReason =
+  | "STOP_LOSS"
+  | "PROFIT_REVERSAL_MINI_GATE"
+  | "PROFIT_REVERSAL_MAJOR_GATE"
+  | "MAX_HOLD";
+
+export type ExitEvaluation = {
+  shouldExit: boolean;
+  reason?: TrendExitReason;
+  rawMoveWad: Wad;
+  moveWad: Wad;
+  bestMoveWad: Wad;
+  effectiveStopWad?: Wad;
+  miniGateArmed: boolean;
+  majorGateLocked: boolean;
+};
+
+function wadToPctNum(x: Wad): number {
+  return Number(x) / 1e16;
+}
 
 const MIN_DATA_POINTS = 80;
 
@@ -313,6 +335,7 @@ const MIN_DATA_POINTS = 80;
 const lastCandleCloseAtMs = new Map<string, number>(); // key: user:symbol:timeframe
 const lastActionAt = new Map<string, number>();        // key: user:symbol
 const activeTrades = new Map<string, ActiveTrade>();   // key: user:symbol
+const lastTrailTelemetry = new Map<string, string>();  // key: user:symbol
 
 // Regime timeframe (1h) direction memory — updated each tick before 5m entry
 const trendRegime = new Map<string, { dir: "LONG" | "SHORT" | "NONE"; updatedAt: number }>(); // key: user:symbol
@@ -340,6 +363,76 @@ async function loadUserConfigCached(redis: any, userAddr: string): Promise<BotCo
   const cfg = await loadUserConfig(redis, userAddr);
   _cfgCache.set(userAddr, { cfg, expiresAt: now + CFG_CACHE_TTL_MS });
   return cfg;
+}
+
+function getLeveragedMoveWad(
+  t: Pick<ActiveTrade, "entryPriceWad" | "isLong" | "leverage">,
+  price: Wad,
+): Wad {
+  return mulWad(movePctWad(t as ActiveTrade, price), toWad(t.leverage));
+}
+
+function isMoreFavorablePrice(
+  t: Pick<ActiveTrade, "isLong">,
+  next: Wad,
+  current: Wad,
+): boolean {
+  return t.isLong ? next > current : next < current;
+}
+
+function hasMiniGateArmed(
+  t: Pick<ActiveTrade, "entryPriceWad" | "isLong" | "leverage" | "bestPriceWad">,
+  cfg: BotConfig,
+): boolean {
+  return getLeveragedMoveWad(t, t.bestPriceWad) >= toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);
+}
+
+export function maybeAdvanceLiveProfitPeak(t: ActiveTrade, price: Wad, cfg: BotConfig): void {
+  const liveMove = getLeveragedMoveWad(t, price);
+  const minGate = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);
+
+  if (liveMove >= minGate && isMoreFavorablePrice(t, price, t.bestPriceWad)) {
+    updateBest(t, price);
+    return;
+  }
+
+  if (isMoreFavorablePrice(t, price, t.pendingBestWad)) {
+    t.pendingBestWad = price;
+    t.pendingBestSeenAtMs = Date.now();
+  }
+}
+
+function emitTrailTelemetry(
+  deps: Pick<EngineDeps, "emit">,
+  t: Pick<ActiveTrade, "userKey" | "symbol" | "timeframe">,
+  evaluation: ExitEvaluation,
+) {
+  const signature = [
+    evaluation.reason ?? "HOLD",
+    evaluation.miniGateArmed ? "1" : "0",
+    evaluation.majorGateLocked ? "1" : "0",
+    Math.round(wadToPctNum(evaluation.bestMoveWad) * 100),
+    Math.round(wadToPctNum(evaluation.moveWad) * 100),
+    Math.round(wadToPctNum(evaluation.effectiveStopWad ?? 0n) * 100),
+  ].join(":");
+
+  const posKey = posKeyOf(t.userKey, t.symbol);
+  if (lastTrailTelemetry.get(posKey) === signature) return;
+  lastTrailTelemetry.set(posKey, signature);
+
+  emit(deps as EngineDeps, {
+    type: "TRAIL_STATUS",
+    userKey: t.userKey,
+    symbol: t.symbol,
+    timeframe: t.timeframe,
+    reason: evaluation.reason ?? "HOLD",
+    miniGateArmed: evaluation.miniGateArmed,
+    majorGateLocked: evaluation.majorGateLocked,
+    currentLevPnlPct: wadToPctNum(evaluation.moveWad),
+    bestLevPnlPct: wadToPctNum(evaluation.bestMoveWad),
+    effectiveStopLevPct: evaluation.effectiveStopWad != null ? wadToPctNum(evaluation.effectiveStopWad) : null,
+    shouldExit: evaluation.shouldExit,
+  });
 }
 
 function emit(deps: EngineDeps, e: Record<string, any>) {
@@ -392,6 +485,7 @@ export async function restoreState(
         bestPriceWad:    BigInt(ct.bestPriceWad),
         // pendingBestWad defaults to bestPriceWad if not stored (backwards-compat)
         pendingBestWad:  ct.pendingBestWad ? BigInt(ct.pendingBestWad) : BigInt(ct.bestPriceWad),
+        pendingBestSeenAtMs: ct.pendingBestSeenAtMs ?? ct.openedAtMs ?? Date.now(),
         sizeWad:         BigInt(ct.sizeWad),
         openedAtMs: ct.openedAtMs ?? Date.now(), // fallback: treat legacy trades (no timestamp) as just opened — they'll be recycled by 12h gate on next restart
         pending: false,
@@ -446,6 +540,7 @@ export function registerTradeAfterExecution(args: {
     entryPriceWad:  args.entryPriceWad,
     bestPriceWad:   args.entryPriceWad,
     pendingBestWad: args.entryPriceWad, // starts at entry; advances via 2-phase confirmation
+    pendingBestSeenAtMs: args.openedAtMs ?? Date.now(),
     sizeWad: args.sizeWad,
     openedAtMs: args.openedAtMs ?? Date.now(),
     pending: false,
@@ -462,6 +557,7 @@ export function registerTradeAfterExecution(args: {
       entryPriceWad:  trade.entryPriceWad.toString(),
       bestPriceWad:   trade.bestPriceWad.toString(),
       pendingBestWad: trade.pendingBestWad.toString(),
+      pendingBestSeenAtMs: trade.pendingBestSeenAtMs,
       sizeWad:        trade.sizeWad.toString(),
       openedAtMs: trade.openedAtMs, pending: false,
     };
@@ -725,16 +821,18 @@ function updateBest(t: ActiveTrade, price: Wad): void {
     if (price > t.bestPriceWad) {
       t.bestPriceWad  = price;
       t.pendingBestWad = price; // keep in sync for Redis persistence / compat
+      t.pendingBestSeenAtMs = Date.now();
     }
   } else {
     if (price < t.bestPriceWad) {
       t.bestPriceWad  = price;
       t.pendingBestWad = price;
+      t.pendingBestSeenAtMs = Date.now();
     }
   }
 }
 
-function movePctWad(t: ActiveTrade, price: Wad): Wad {
+function movePctWad(t: Pick<ActiveTrade, "entryPriceWad" | "isLong">, price: Wad): Wad {
   return t.isLong ? divWad(price - t.entryPriceWad, t.entryPriceWad) : divWad(t.entryPriceWad - price, t.entryPriceWad);
 }
 
@@ -742,7 +840,12 @@ function movePctWad(t: ActiveTrade, price: Wad): Wad {
 // shouldExit — bestPriceWad is now advanced by an explicit updateBest() call in
 // the scanner BEFORE shouldExit is called.  The fast monitor still passes false
 // (it must never advance bestPriceWad from raw WS tick prices).
-function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 0, advanceBestPrice = true, candleExtreme?: Wad): boolean {
+export function evaluateActiveTradeExit(
+  t: Pick<ActiveTrade, "entryPriceWad" | "isLong" | "leverage" | "bestPriceWad" | "openedAtMs">,
+  price: Wad,
+  cfg: BotConfig,
+  currentAtrPct = 0,
+): ExitEvaluation {
   const rawMove = movePctWad(t, price); // raw price % (no leverage), direction-aware
 
   // ── 1. Hard stop-loss — leverage-tiered ────────────────────────────────────
@@ -771,7 +874,18 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
     rawStopNum = cfg.STOP_LOSS_PCT;
   }
   const stop = toWad(rawStopNum);
-  if (rawMove <= -stop) return true;
+  if (rawMove <= -stop) {
+    return {
+      shouldExit: true,
+      reason: "STOP_LOSS",
+      rawMoveWad: rawMove,
+      moveWad: getLeveragedMoveWad(t, price),
+      bestMoveWad: getLeveragedMoveWad(t, t.bestPriceWad),
+      effectiveStopWad: -stop,
+      miniGateArmed: false,
+      majorGateLocked: false,
+    };
+  }
 
   // bestPriceWad is advanced by an explicit updateBest() call in the scanner loop
   // before shouldExit is called, so there is nothing to do here.
@@ -804,19 +918,31 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   //   peak = 30% lev (3.0% raw) → floor = 30% lev ← MAJOR GATE LOCKS HERE
   //   peak = 40% lev (4.0% raw) → floor = 37% lev (trailing above major gate)
   // ───────────────────────────────────────────────────────────────────────────
-  const levWad    = toWad(t.leverage);
-  const move      = mulWad(rawMove, levWad);                        // leveraged current PnL
-  const bestMove  = mulWad(movePctWad(t, t.bestPriceWad), levWad); // leveraged peak PnL
+  const move      = getLeveragedMoveWad(t, price);                 // leveraged current PnL
+  const bestMove  = getLeveragedMoveWad(t, t.bestPriceWad);        // leveraged peak PnL
   const minGate   = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);         // 3% lev  — first step
   const lockGate  = toWad(cfg.PROFIT_LOCK_GATE);                   // 30% lev — major gate, permanent floor
   const trail     = toWad(cfg.EXIT_ON_PROFIT_REVERSAL);            // 3% lev  — step size / give-back
+  const miniGateArmed = bestMove >= minGate;
+  const majorGateLocked = bestMove >= lockGate;
 
   if (bestMove >= minGate) {
     const trailLevel = bestMove - trail;
     let effectiveStop = trailLevel > minGate ? trailLevel : minGate; // max(minGate, peak − step)
     // Major gate: once peak reaches lockGate, snap floor up permanently
     if (bestMove >= lockGate && effectiveStop < lockGate) effectiveStop = lockGate;
-    if (move <= effectiveStop) return true;
+    if (move <= effectiveStop) {
+      return {
+        shouldExit: true,
+        reason: majorGateLocked ? "PROFIT_REVERSAL_MAJOR_GATE" : "PROFIT_REVERSAL_MINI_GATE",
+        rawMoveWad: rawMove,
+        moveWad: move,
+        bestMoveWad: bestMove,
+        effectiveStopWad: effectiveStop,
+        miniGateArmed,
+        majorGateLocked,
+      };
+    }
   }
 
   // ── 3. Maximum hold time — dead-capital protection ────────────────────────
@@ -824,9 +950,32 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   // close it at market to free capital for new signals.
   // Applies even if in profit/loss — better to recycle than hold indefinitely.
   const MAX_HOLD_MS = 12 * 60 * 60 * 1000; // 12 hours
-  if (Date.now() - Number(t.openedAtMs) >= MAX_HOLD_MS) return true;
+  if (Date.now() - Number(t.openedAtMs) >= MAX_HOLD_MS) {
+    return {
+      shouldExit: true,
+      reason: "MAX_HOLD",
+      rawMoveWad: rawMove,
+      moveWad: move,
+      bestMoveWad: bestMove,
+      miniGateArmed,
+      majorGateLocked,
+    };
+  }
 
-  return false;
+  return {
+    shouldExit: false,
+    rawMoveWad: rawMove,
+    moveWad: move,
+    bestMoveWad: bestMove,
+    miniGateArmed,
+    majorGateLocked,
+  };
+}
+
+function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 0, advanceBestPrice = true, candleExtreme?: Wad): boolean {
+  void advanceBestPrice;
+  void candleExtreme;
+  return evaluateActiveTradeExit(t, price, cfg, currentAtrPct).shouldExit;
 }
 
 // ── Fast-path exit monitor (called every ~500ms using live WS prices) ─────────
@@ -856,6 +1005,7 @@ export async function fastExitCheck(
   const priceWad = toWad(livePrice);
   // Use cached config (10s TTL) to avoid hammering Redis on every 500ms tick
   const cfg = deps.redis ? await loadUserConfigCached(deps.redis, userKey) : DEFAULT_CFG;
+  maybeAdvanceLiveProfitPeak(t, priceWad, cfg);
 
   // ── Minimum hold time guard (fast monitor) ─────────────────────────────────
   // Mirror the 60-second hold window used by the 10s kline scanner.
@@ -865,7 +1015,7 @@ export async function fastExitCheck(
   // Hard stop-loss (rawMove ≤ -stop) is still allowed to fire immediately.
   const fastHeldMs  = Date.now() - t.openedAtMs;
   const MIN_HOLD_MS = 60_000;
-  if (fastHeldMs < MIN_HOLD_MS) {
+  if (fastHeldMs < MIN_HOLD_MS && !hasMiniGateArmed(t, cfg)) {
     // Only allow an immediate hard stop; skip the trailing-stop check entirely.
     const rawMoveF  = movePctWad(t, priceWad);
     const rawStopF  = t.leverage >= 40
@@ -878,12 +1028,14 @@ export async function fastExitCheck(
   // WS prices include micro-spikes that reverse within < 500ms; locking bestPriceWad
   // to a spike would cause exits far below the gate on the very next tick.
   // bestPriceWad is advanced exclusively by the 10s kline scanner (advanceBestPrice=true).
-  if (!shouldExit(t, priceWad, cfg, 0, false)) return;
+  const exitEval = evaluateActiveTradeExit(t, priceWad, cfg, 0);
+  emitTrailTelemetry(deps, t, exitEval);
+  if (!exitEval.shouldExit) return;
 
   // Mark closing immediately — prevents the 10s scanner from also attempting a close
   t.closing = true;
   const heldMs = Date.now() - Number(t.openedAtMs);
-  const exitReason = heldMs >= 12 * 60 * 60 * 1000 ? "max_hold_exit" : "risk_exit";
+  const exitReason = exitEval.reason === "MAX_HOLD" ? "max_hold_exit" : String(exitEval.reason ?? "risk_exit").toLowerCase();
   emit(deps as unknown as EngineDeps, { type: "EXIT_SIGNAL", userKey, symbol, timeframe: t.timeframe, reason: exitReason, heldMinutes: Math.round(heldMs / 60000) });
 
   try {
@@ -892,6 +1044,7 @@ export async function fastExitCheck(
     if (String(closeErr?.message ?? "").includes("no open pos")) {
       log.warn({ symbol }, "[botWorker/fast] ghost trade detected — clearing local state");
       activeTrades.delete(pk);
+      lastTrailTelemetry.delete(pk);
       if (deps.redis) deleteActiveTrade(deps.redis, userKey, symbol).catch(() => {});
       emit(deps as unknown as EngineDeps, { type: "GHOST_TRADE_CLEARED", userKey, symbol, timeframe: t.timeframe });
       return;
@@ -909,13 +1062,14 @@ export async function fastExitCheck(
     : (entryPrice - exitPrice) / entryPrice;
 
   activeTrades.delete(pk);
+  lastTrailTelemetry.delete(pk);
   if (deps.redis) {
     deleteActiveTrade(deps.redis, userKey, symbol).catch(() => {});
     appendClosedTrade(deps.redis, userKey, {
       symbol, isLong: t.isLong, entryPrice, exitPrice,
       pnlPct: rawMove, leverage: t.leverage,
       durationMs: Date.now() - t.openedAtMs,
-      reason: "risk_exit", closedAt: Date.now(),
+      reason: exitEval.reason ?? "RISK_EXIT", closedAt: Date.now(),
     }).catch(() => {});
     recordDailyReturn(deps.redis, userKey, rawMove * t.leverage).catch(() => {});
     const fk = entryFeatureKeys.get(pk);
@@ -927,7 +1081,14 @@ export async function fastExitCheck(
 
   if (deps.redis) await applyCooldown(deps.redis, userKey, symbol, cfg);
   recordAct(pk);
-  emit(deps as unknown as EngineDeps, { type: "POSITION_CLOSED", userKey, symbol, timeframe: t.timeframe, pnlPct: rawMove * t.leverage });
+  emit(deps as unknown as EngineDeps, {
+    type: "POSITION_CLOSED",
+    userKey,
+    symbol,
+    timeframe: t.timeframe,
+    pnlPct: rawMove * t.leverage,
+    reason: exitEval.reason,
+  });
   log.info({ symbol, pnlPct: (rawMove * t.leverage * 100).toFixed(2) + "%", livePrice }, "[botWorker/fast] exit executed via fast monitor");
 }
 
@@ -1395,6 +1556,7 @@ export async function evaluateUserSymbol(
       } catch (closeErr: any) {
         if (String(closeErr?.message ?? "").includes("no open pos")) {
           activeTrades.delete(pk);
+          lastTrailTelemetry.delete(pk);
           if (deps.redis) deleteActiveTrade(deps.redis, userKey, symbol).catch(() => {});
           emit(deps, { type: "GHOST_TRADE_CLEARED", userKey, symbol, timeframe });
           return;
@@ -1406,6 +1568,7 @@ export async function evaluateUserSymbol(
       const entryPrice = Number(t.entryPriceWad) / 1e18;
       const rawMove    = t.isLong ? (exitPrice - entryPrice) / entryPrice : (entryPrice - exitPrice) / entryPrice;
       activeTrades.delete(pk);
+      lastTrailTelemetry.delete(pk);
       if (deps.redis) {
         deleteActiveTrade(deps.redis, userKey, symbol).catch(() => {});
         appendClosedTrade(deps.redis, userKey, {
@@ -1445,7 +1608,7 @@ export async function evaluateUserSymbol(
     // those protect against sudden crashes where waiting 60 s is dangerous.
     const trailHeldMs   = Date.now() - t.openedAtMs;
     const MIN_TRAIL_MS  = 60_000; // 60 seconds
-    const trailReady    = trailHeldMs >= MIN_TRAIL_MS;
+    const trailReady    = trailHeldMs >= MIN_TRAIL_MS || hasMiniGateArmed(t, cfg);
 
     // Always advance bestPriceWad from the kline extreme, even during the hold window.
     // Peaks that occur in the first 60 s are now tracked correctly so the trailing
@@ -1462,9 +1625,17 @@ export async function evaluateUserSymbol(
 
     // advanceBestPrice=false: bestPriceWad already updated above; pass false so
     // shouldExit does not attempt a redundant second advance.
-    if (hardStopNow || (trailReady && shouldExit(t, priceWad, cfg, liveAtrPct, false, candleExtreme))) {
+    const exitEval = evaluateActiveTradeExit(t, priceWad, cfg, liveAtrPct);
+    emitTrailTelemetry(deps, t, exitEval);
+    if (hardStopNow || (trailReady && exitEval.shouldExit)) {
       t.closing = true; // guard: prevents fast-exit monitor from double-closing
-      emit(deps, { type: "EXIT_SIGNAL", userKey, symbol, timeframe, reason: "risk_exit" });
+      emit(deps, {
+        type: "EXIT_SIGNAL",
+        userKey,
+        symbol,
+        timeframe,
+        reason: hardStopNow ? "stop_loss" : String(exitEval.reason ?? "risk_exit").toLowerCase(),
+      });
 
       try {
         await deps.closePosition({ userKey, symbol, timeframe, exitPriceWad: priceWad });
@@ -1474,6 +1645,7 @@ export async function evaluateUserSymbol(
         if (String(closeErr?.message ?? "").includes("no open pos")) {
           log.warn({ symbol }, "[botWorker] ghost trade detected (no open pos on-chain) — clearing local state");
           activeTrades.delete(pk);
+          lastTrailTelemetry.delete(pk);
           if (deps.redis) deleteActiveTrade(deps.redis, userKey, symbol).catch(() => {});
           emit(deps, { type: "GHOST_TRADE_CLEARED", userKey, symbol, timeframe });
           return;
@@ -1493,6 +1665,7 @@ export async function evaluateUserSymbol(
         : (entryPrice - exitPrice) / entryPrice;
 
       activeTrades.delete(pk);
+      lastTrailTelemetry.delete(pk);
       // Remove from Redis
       if (deps.redis) {
         deleteActiveTrade(deps.redis, userKey, symbol).catch(() => {});
@@ -1501,7 +1674,7 @@ export async function evaluateUserSymbol(
           symbol, isLong: t.isLong, entryPrice, exitPrice,
           pnlPct: rawMove, leverage: t.leverage,
           durationMs: Date.now() - t.openedAtMs,
-          reason: "risk_exit", closedAt: Date.now(),
+          reason: hardStopNow ? "STOP_LOSS" : (exitEval.reason ?? "RISK_EXIT"), closedAt: Date.now(),
         }).catch(() => {});
 
         // ── Phase 3a: Update daily drawdown tracker ────────────────────────
@@ -1520,7 +1693,14 @@ export async function evaluateUserSymbol(
       recordAct(pk);
 
       // Emit leveraged PnL (matches what dashboard shows: rawMove × leverage)
-      emit(deps, { type: "POSITION_CLOSED", userKey, symbol, timeframe, pnlPct: rawMove * t.leverage });
+      emit(deps, {
+        type: "POSITION_CLOSED",
+        userKey,
+        symbol,
+        timeframe,
+        pnlPct: rawMove * t.leverage,
+        reason: hardStopNow ? "STOP_LOSS" : exitEval.reason,
+      });
       return;
     }
 
@@ -1533,6 +1713,7 @@ export async function evaluateUserSymbol(
         entryPriceWad:  t.entryPriceWad.toString(),
         bestPriceWad:   t.bestPriceWad.toString(),
         pendingBestWad: t.pendingBestWad.toString(),
+        pendingBestSeenAtMs: t.pendingBestSeenAtMs,
         sizeWad:        t.sizeWad.toString(),
         openedAtMs: t.openedAtMs, pending: t.pending,
       };
@@ -1690,6 +1871,7 @@ if (sizeWad <= 0n) {
     entryPriceWad:  priceWad,
     bestPriceWad:   priceWad,
     pendingBestWad: priceWad, // starts at entry; advances via 2-phase confirmation
+    pendingBestSeenAtMs: Date.now(),
     sizeWad,
     openedAtMs: Date.now(),
     pending: true,
@@ -1735,6 +1917,7 @@ if (sizeWad <= 0n) {
           entryPriceWad:  trade.entryPriceWad.toString(),
           bestPriceWad:   trade.bestPriceWad.toString(),
           pendingBestWad: trade.pendingBestWad.toString(),
+          pendingBestSeenAtMs: trade.pendingBestSeenAtMs,
           sizeWad:        trade.sizeWad.toString(),
           openedAtMs: trade.openedAtMs, pending: false,
         };
