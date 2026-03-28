@@ -32,6 +32,12 @@ import {
   validateUserTradingConfig as validateUserTradingConfigInput,
 } from "./services/users/userTradingConfig.js";
 import {
+  getUserBotLaunchConfig,
+  type UserBotLaunchConfig,
+  patchUserBotLaunchConfig,
+  validateUserBotLaunchConfig,
+} from "./services/users/userBotLaunchConfig.js";
+import {
   sendVerificationEmail, sendApprovalEmail, sendRejectionEmail,
   sendAdminNewUserAlert,
 } from "./services/email/mailer.js";
@@ -50,6 +56,8 @@ import { getSigner, getVaultWriteContract, getProvider, getVaultAddress } from "
 import { recordDeposit, recordWithdrawal, recordSubscriptionPayment, checkSubscription, getUserFeeStats, FEE } from "./services/fees/feeEngine.js";
 import { workerPool } from "./services/bot/workerPool.js";
 import { getCandleCacheStats } from "./services/market/binanceCandles.js";
+import { canOverrideUserQuery, hasValidAdminKeyHeader, validateWalletLinkMessage } from "./services/auth/security.js";
+import { adminRouteHttpStatus, buildRetiredRouteResponse } from "./services/auth/routePolicies.js";
 
 const PORT                = Number(process.env.PORT ?? "5050");
 const ADMIN_KEY           = process.env.ADMIN_KEY ?? "";               // kept for internal CLI only
@@ -58,6 +66,7 @@ const JWT_SECRET          = process.env.JWT_SECRET ?? "CHANGEME_REPLACE_BEFORE_L
 const LOGIN_PASSWORD_HASH = process.env.LOGIN_PASSWORD_HASH ?? "";
 const JWT_EXPIRES_IN      = "8h";
 const ADMIN_EMAIL         = process.env.ADMIN_EMAIL ?? "";
+const WALLET_LINK_PREFIX  = "UrumTrader wallet link";
 
 // ── In-memory rate limiter (login endpoint) ───────────────────────────────────
 const _rlMap = new Map<string, { count: number; resetAt: number }>();
@@ -159,15 +168,20 @@ async function auditLog(adminId: string, action: string, targetUserId: string, d
  */
 async function resolveUserKey(
   req: http.IncomingMessage,
-  u: URL
+  u: URL,
+  opts: { allowQueryOverride?: boolean } = {}
 ): Promise<string> {
+  const payload = decodeToken(req);
+
   // 1. Query param
   const q = u.searchParams.get("user");
-  if (q) return q.toLowerCase();
+  if (q && opts.allowQueryOverride) {
+    const isPrivileged = canOverrideUserQuery(payload, hasValidAdminKey(req));
+    if (isPrivileged) return q;
+  }
 
   // 2. JWT
   try {
-    const payload = decodeToken(req);
     if (payload?.userId) {
       const user = await getUserById(getRedis(), payload.userId).catch(() => null);
       if (user?.walletAddress) return user.walletAddress.toLowerCase();
@@ -177,11 +191,69 @@ async function resolveUserKey(
   return "";
 }
 
+async function getEffectiveBotLaunchConfig(userId?: string) {
+  const base = {
+    symbols: currentSymbols,
+    strategy: currentStrategy,
+    trigger: currentTrigger,
+  };
+
+  if (!userId) return base;
+
+  const saved: UserBotLaunchConfig = await getUserBotLaunchConfig(getRedis(), userId).catch(() => ({}));
+  return {
+    symbols: saved.symbols?.length ? saved.symbols : base.symbols,
+    strategy: saved.strategy ?? base.strategy,
+    trigger: { ...base.trigger, ...(saved.trigger ?? {}) },
+  };
+}
+
+const USER_RUNTIME_CONFIG_KEYS = [
+  "DEFAULT_LEVERAGE",
+  "MAX_LEVERAGE",
+  "MANUAL_SIZE_PCT",
+  "VOTE_REQUIRED",
+  "MIN_PROFIT_BEFORE_REVERSAL",
+  "EXIT_ON_PROFIT_REVERSAL",
+  "STOP_LOSS_PCT",
+  "COOLDOWN_SECONDS",
+  "ATR_PERIOD",
+  "ATR_VOLATILITY_THRESHOLD",
+] as const;
+
+function hasUserRuntimeConfigPatch(raw: Record<string, unknown>) {
+  return USER_RUNTIME_CONFIG_KEYS.some((key) => raw[key] !== undefined);
+}
+
+async function patchUserRuntimeConfig(userKey: string, raw: Record<string, unknown>, activeSymbols: string[]) {
+  const redis = getRedis();
+  const existing = await (async () => {
+    try {
+      const s = await redis.get(CFG_KEYS.user(userKey));
+      return s ? JSON.parse(s) : {};
+    } catch {
+      return {};
+    }
+  })();
+  const merged = { ...existing, ...raw };
+  const validated = validateConfig(merged);
+  for (const sym of activeSymbols) {
+    const cap = symbolMaxLev(sym);
+    if (validated.DEFAULT_LEVERAGE > cap) validated.DEFAULT_LEVERAGE = cap;
+    if (validated.MAX_LEVERAGE > cap) validated.MAX_LEVERAGE = cap;
+  }
+  await redis.set(CFG_KEYS.user(userKey), JSON.stringify(validated));
+  return validated;
+}
+
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
+function hasValidAdminKey(req: http.IncomingMessage) {
+  return hasValidAdminKeyHeader(ADMIN_KEY, String(req.headers["x-admin-key"] ?? "") || undefined);
+}
+
 function requireAdmin(req: http.IncomingMessage) {
   if (!ADMIN_KEY) return null;
-  const key = String(req.headers["x-admin-key"] ?? "");
-  if (!key || key !== ADMIN_KEY) return "unauthorized";
+  if (!hasValidAdminKey(req)) return "unauthorized";
   return null;
 }
 
@@ -192,8 +264,7 @@ async function readJson(req: http.IncomingMessage) {
   return raw ? JSON.parse(raw) : {};
 }
 
-http
-  .createServer(async (req, res) => {
+export async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
     setCors(res);
     if (req.method === "OPTIONS") return res.end();
 
@@ -380,15 +451,25 @@ http
         try {
           const b = await readJson(req);
           const walletAddress = String(b.walletAddress ?? "").trim();
+          const message = String(b.message ?? "");
+          const signature = String(b.signature ?? "");
           if (!walletAddress || !/^0x[0-9a-fA-F]{40}$/.test(walletAddress))
             return json(res, 400, { ok: false, error: "Valid wallet address required" });
-          // Verify signature if provided
-          if (b.signature && b.message) {
-            const { ethers } = await import("ethers");
-            const recovered = ethers.verifyMessage(String(b.message), String(b.signature));
-            if (recovered.toLowerCase() !== walletAddress.toLowerCase())
-              return json(res, 400, { ok: false, error: "Signature verification failed" });
+          if (!message || !signature) {
+            return json(res, 400, { ok: false, error: "Wallet signature is required" });
           }
+          if (!validateWalletLinkMessage({
+            message,
+            walletAddress,
+            userId: payload.userId,
+            prefix: WALLET_LINK_PREFIX,
+          })) {
+            return json(res, 400, { ok: false, error: "Invalid wallet-link message" });
+          }
+          const { ethers } = await import("ethers");
+          const recovered = ethers.verifyMessage(message, signature);
+          if (recovered.toLowerCase() !== walletAddress.toLowerCase())
+            return json(res, 400, { ok: false, error: "Signature verification failed" });
           await updateUser(getRedis(), payload.userId, { walletAddress });
           return json(res, 200, { ok: true, walletAddress });
         } catch (e: any) {
@@ -625,18 +706,26 @@ http
 
       if (u.pathname === "/bot/config") {
         if (req.method === "GET" || req.method === "HEAD") {
+          const authErr = requireAuth(req);
+          if (authErr) return json(res, 401, { ok: false, error: authErr });
+          const payload = decodeToken(req);
           const userKey = await resolveUserKey(req, u);
+          const effective = await getEffectiveBotLaunchConfig(payload?.userId);
           return json(res, 200, {
             userAddress: userKey,
-            symbols: currentSymbols,
-            strategy: currentStrategy,
-            trigger: currentTrigger,
+            symbols: effective.symbols,
+            strategy: effective.strategy,
+            trigger: effective.trigger,
           });
         }
       }
 
       if (u.pathname === "/bot/state") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const payload = decodeToken(req);
         const userKey = await resolveUserKey(req, u);
+        const effective = await getEffectiveBotLaunchConfig(payload?.userId);
         const baseState = getState();
         const workerRunning = userKey ? workerPool.isRunning(userKey) : false;
         const workerStatus  = userKey ? workerPool.getUserStatus(userKey) : null;
@@ -644,9 +733,9 @@ http
           ok: true,
           config: {
             userAddress: userKey,
-            symbols: currentSymbols,
-            strategy: currentStrategy,
-            trigger: currentTrigger,
+            symbols: effective.symbols,
+            strategy: effective.strategy,
+            trigger: effective.trigger,
           },
           state: {
             ...baseState,
@@ -658,7 +747,10 @@ http
 
       // View vault balances (read-only)
       if (u.pathname === "/vault/balances") {
-        const user = await resolveUserKey(req, u);
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const adminResult = await requireAdminRole(req);
+        const user = await resolveUserKey(req, u, { allowQueryOverride: !("error" in adminResult) });
         if (!user) return json(res, 400, { ok: false, error: "missing user" });
         const r = await getVaultBalances(user);
         return json(res, 200, { ok: true, user, balances: r });
@@ -666,8 +758,11 @@ http
 
       // Debug: see all open positions for a user
       if (u.pathname === "/vault/position") {
-        const user = await resolveUserKey(req, u);
-        if (!user) return json(res, 400, { ok: false, error: "missing user" });
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const adminResult = await requireAdminRole(req);
+        const user = await resolveUserKey(req, u, { allowQueryOverride: !("error" in adminResult) });
+        if (!user) return json(res, 400, { ok: false, error: "no user configured" });
         const c = getVaultReadContract();
         const markets: string[] = await c.getOpenMarkets(user);
         const positions: Record<string, any> = {};
@@ -686,8 +781,10 @@ http
       }
 
       if (u.pathname === "/bot/set" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) {
+          return json(res, adminRouteHttpStatus(adminResult.error as "unauthorized" | "forbidden" | "session expired"), { ok: false, error: adminResult.error });
+        }
         try {
           const b = await readJson(req);
           if (b.symbols != null) {
@@ -705,6 +802,7 @@ http
             if (typeof t.stochDLen === "number") currentTrigger.stochDLen = t.stochDLen;
           }
           const userKey = await resolveUserKey(req, u);
+          await auditLog(adminResult.userId, "bot:set", userKey || "*", `symbols=${currentSymbols.join(",")}`);
           return json(res, 200, {
             ok: true,
             config: { userAddress: userKey, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
@@ -743,44 +841,111 @@ http
         }
       }
 
-      // ── POST /bot/start — start bot for current authenticated user ────────
-      if (u.pathname === "/bot/start" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+      if (u.pathname === "/me/bot/config" && req.method === "GET") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const payload = decodeToken(req);
+        const userKey = await resolveUserKey(req, u);
+        const effective = await getEffectiveBotLaunchConfig(payload?.userId);
+        return json(res, 200, {
+          ok: true,
+          config: {
+            userAddress: userKey,
+            symbols: effective.symbols,
+            strategy: effective.strategy,
+            trigger: effective.trigger,
+          },
+        });
+      }
+
+      if (u.pathname === "/me/bot/config" && req.method === "PATCH") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const payload = decodeToken(req);
+        if (!payload?.userId) return json(res, 401, { ok: false, error: "unauthorized" });
         try {
-          const userKey = (await resolveUserKey(req, u)) || getSigner().address;
-          const payload  = decodeToken(req);
-          const userId   = payload?.userId as string | undefined;
+          const body = await readJson(req);
+          const userKey = await resolveUserKey(req, u);
+          if (!userKey) return json(res, 400, { ok: false, error: "no user configured" });
+
+          const patch = validateUserBotLaunchConfig(body);
+          const saved = await patchUserBotLaunchConfig(getRedis(), payload.userId, patch);
+          let runtimeConfig: any = undefined;
+          if (hasUserRuntimeConfigPatch(body)) {
+            const nextSymbols = patch.symbols?.length ? patch.symbols : (saved.symbols?.length ? saved.symbols : currentSymbols);
+            runtimeConfig = await patchUserRuntimeConfig(userKey, body, nextSymbols);
+          }
+          const effective = await getEffectiveBotLaunchConfig(payload.userId);
+          log.info({ userId: payload.userId, userKey, patch }, "[user] bot launch config updated");
+          return json(res, 200, {
+            ok: true,
+            saved,
+            runtimeConfig,
+            config: {
+              userAddress: userKey,
+              symbols: effective.symbols,
+              strategy: effective.strategy,
+              trigger: effective.trigger,
+            },
+          });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      if (u.pathname === "/me/bot/start" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload = decodeToken(req);
+          const userKey = await resolveUserKey(req, u);
+          if (!payload?.userId || !userKey) return json(res, 400, { ok: false, error: "no user configured" });
+          const effective = await getEffectiveBotLaunchConfig(payload.userId);
           const r = await workerPool.startUser({
             userKey,
-            symbols:  currentSymbols,
-            trigger:  currentTrigger,
-            strategy: currentStrategy,
-            userId,
+            symbols: effective.symbols,
+            trigger: effective.trigger,
+            strategy: effective.strategy,
+            userId: payload.userId,
           });
-          if (r.ok) {
-            await getRedis().set("bot:engine:autostart", JSON.stringify({
-              running: true, userKey, symbols: currentSymbols, trigger: currentTrigger, strategy: currentStrategy,
-            }));
-          }
           return json(res, r.ok ? 200 : 400, r);
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
       }
 
-      // ── POST /bot/stop — stop bot for current authenticated user ─────────
-      if (u.pathname === "/bot/stop" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+      if (u.pathname === "/me/bot/stop" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
         try {
-          const userKey = (await resolveUserKey(req, u)) || getSigner().address;
+          const userKey = await resolveUserKey(req, u);
+          if (!userKey) return json(res, 400, { ok: false, error: "no user configured" });
           const r = workerPool.stopUser(userKey);
-          await getRedis().del("bot:engine:autostart");
           return json(res, 200, r);
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
+      }
+
+      // @deprecated — migrate to POST /pool/start. This route uses the global
+      // @retired — use POST /pool/start. The old /bot/start route is intentionally disabled
+      // to avoid reintroducing single-user route semantics.
+      if (u.pathname === "/bot/start") {
+        res.setHeader("Deprecation", "true");
+        res.setHeader("Sunset", "2026-12-31");
+        log.warn("[RETIRED] POST /bot/start called — use POST /pool/start");
+        const retired = buildRetiredRouteResponse(u.pathname)!;
+        return json(res, retired.status, retired.body);
+      }
+
+      // @retired — use POST /pool/stop. The old /bot/stop route is intentionally disabled
+      // to avoid reintroducing single-user route semantics.
+      if (u.pathname === "/bot/stop") {
+        res.setHeader("Deprecation", "true");
+        res.setHeader("Sunset", "2026-12-31");
+        log.warn("[RETIRED] POST /bot/stop called — use POST /pool/stop");
+        const retired = buildRetiredRouteResponse(u.pathname)!;
+        return json(res, retired.status, retired.body);
       }
 
       // ── POST /pool/start — start bot for a specific user (admin) ─────────
@@ -869,12 +1034,13 @@ http
 
       // ── Close all open on-chain positions (admin) ─────────────────────────
       if (u.pathname === "/bot/closeall" && req.method === "POST") {
-        // Accept either JWT bearer token OR X-Admin-Key header
-        const adminKeyErr = requireAdmin(req);
-        const jwtErr      = requireAuth(req);
-        if (adminKeyErr !== null && jwtErr !== null) return json(res, 401, { ok: false, error: "unauthorized" });
+        const adminResult = await requireAdminRole(req);
+        const legacyAdmin = hasValidAdminKey(req);
+        if (!legacyAdmin && "error" in adminResult) {
+          return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        }
         try {
-          const user = await resolveUserKey(req, u);
+          const user = await resolveUserKey(req, u, { allowQueryOverride: true });
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
           const readC  = getVaultReadContract();
           const markets: string[] = await readC.getOpenMarkets(user);
@@ -919,6 +1085,9 @@ http
           }
 
           const closed = results.filter(r => r.ok).length;
+          if (!legacyAdmin && !("error" in adminResult)) {
+            await auditLog(adminResult.userId, "bot:closeall", user, `closed=${closed}/${markets.length}`);
+          }
           return json(res, 200, { ok: true, closed, total: markets.length, results });
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
@@ -927,12 +1096,18 @@ http
 
       // ── Close a single position by symbol ────────────────────────────────
       if (u.pathname === "/vault/close-position" && req.method === "POST") {
+        const adminResult = await requireAdminRole(req);
+        const legacyAdmin = hasValidAdminKey(req);
+        const authErr = requireAuth(req);
+        if (authErr && !legacyAdmin) return json(res, 401, { ok: false, error: authErr });
         try {
           const b: any = await readJson(req);
           const symbol: string | undefined = b?.symbol?.toUpperCase();
           if (!symbol) return json(res, 400, { ok: false, error: "symbol required" });
 
-          const user = await resolveUserKey(req, u);
+          const user = await resolveUserKey(req, u, {
+            allowQueryOverride: legacyAdmin || !("error" in adminResult),
+          });
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           const { symbolToMarketId } = await import("./services/onchain/vaultAdapter.js");
@@ -1165,9 +1340,12 @@ http
 
       // ── GET /vault/wallet-balance — wallet USDC + vault + fees + pending ──────
       if (u.pathname === "/vault/wallet-balance") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
         try {
-          const user = await resolveUserKey(req, u);
-          if (!user) return json(res, 400, { ok: false, error: "missing user" });
+          const adminResult = await requireAdminRole(req);
+          const user = await resolveUserKey(req, u, { allowQueryOverride: !("error" in adminResult) });
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
           const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
           const readC = getVaultReadContract();
 
@@ -1281,8 +1459,10 @@ http
       // ── POST /vault/send-to-wallet — transfer USDC from bot signer to any address ─
       // Used to move "Wallet Balance" (held at bot signer address) to user's MetaMask.
       if (u.pathname === "/vault/send-to-wallet" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) {
+          return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        }
         try {
           const b           = await readJson(req);
           const toAddress: string = String(b.toAddress ?? "").trim();
@@ -1304,6 +1484,7 @@ http
           const tx = await (stable as any).transfer(toAddress, amountRaw);
           const receipt = await waitWithFallback(tx);
 
+          await auditLog(adminResult.userId, "vault:send-to-wallet", toAddress, `amount=${amountUsdc}`);
           log.info({ toAddress, amountUsdc, txHash: receipt.hash }, "[vault] send-to-wallet ✓");
           return json(res, 200, { ok: true, txHash: receipt.hash, amount: amountUsdc, toAddress });
         } catch (e: any) {
@@ -1460,7 +1641,8 @@ http
           const txHash      = b.txHash as string;
           const readC       = getVaultReadContract();
           const user        = await resolveUserKey(req, u);
-          const stableX18: bigint = await readC.stableBalanceX18(user ?? "");
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
+          const stableX18: bigint = await readC.stableBalanceX18(user);
           const vaultBalanceUsdc   = +(Number(stableX18) / 1e18).toFixed(6);
           const fees = await recordWithdrawal(getRedis(), userId, grossAmount, vaultBalanceUsdc, "emergency", txHash);
           return json(res, 200, { ok: true, txHash, fees });
@@ -1533,6 +1715,16 @@ http
           blockNumber = Number(await provider.getBlockNumber());
           chainOk = blockNumber > 0;
         } catch { /* */ }
+        // Open positions count
+        let openPositions = 0;
+        try {
+          const c = getVaultReadContract();
+          const userKey = await resolveUserKey(req, u);
+          if (userKey) {
+            const markets: string[] = await (c as any).getOpenMarkets(userKey);
+            openPositions = Array.isArray(markets) ? markets.length : 0;
+          }
+        } catch { /* */ }
         return json(res, 200, {
           ok: true,
           services: {
@@ -1575,8 +1767,14 @@ http
       Sentry.captureException(e);
       return json(res, 500, { ok: false, error: e?.message ?? "internal error" });
     }
-  })
-  .listen(PORT, async () => {
+}
+
+export function createHttpServer() {
+  return http.createServer(handleRequest);
+}
+
+if (process.env.BACKEND_DISABLE_AUTO_START !== "1") {
+  createHttpServer().listen(PORT, async () => {
     try {
       // ── Startup sequence ─────────────────────────────────────────────────────
       // 1. Connect Redis
@@ -1620,6 +1818,7 @@ http
       log.error({ err: e?.message }, "[server] startup error");
     }
   });
+}
 
 // ── Global safety net ─────────────────────────────────────────────────────────
 process.on("uncaughtException", (err: any) => {

@@ -108,6 +108,7 @@ interface BacktestResult {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const TOKEN_KEY = "at_token"; // sessionStorage key for JWT
+const WALLET_LINK_PREFIX = "UrumTrader wallet link";
 
 /** Decode JWT payload without verification (client-side only) */
 function decodeJwtPayload(token: string): { role?: string; userId?: string } {
@@ -115,6 +116,12 @@ function decodeJwtPayload(token: string): { role?: string; userId?: string } {
     const payload = token.split(".")[1];
     return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
   } catch { return {}; }
+}
+
+function buildWalletLinkMessage(walletAddress: string, userId: string) {
+  return `${WALLET_LINK_PREFIX}
+User ID: ${userId}
+Wallet: ${walletAddress.toLowerCase()}`;
 }
 
 const MARKET_SYMBOLS: Record<string, string> = {
@@ -2660,8 +2667,8 @@ export default function App() {
     setActionLoading(true);
     try {
       // Push leverage + sizing + strategy params into bot config before starting
-      await apiFetch("/bot/config", {
-        method: "POST",
+      await apiFetch("/me/bot/config", {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           DEFAULT_LEVERAGE: launchLeverage,
@@ -2672,7 +2679,7 @@ export default function App() {
           EXIT_ON_PROFIT_REVERSAL: 0.03,
         }),
       });
-      await apiFetch("/bot/start", { method: "POST" });
+      await apiFetch("/me/bot/start", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
@@ -2680,14 +2687,14 @@ export default function App() {
   async function handleStop() {
     setActionLoading(true);
     try {
-      await apiFetch("/bot/stop", { method: "POST" });
+      await apiFetch("/me/bot/stop", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
 
   async function handleSaveConfig(update: Partial<BotConfig>) {
-    await apiFetch("/bot/set", {
-      method: "POST",
+    await apiFetch("/me/bot/config", {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(update),
     });
@@ -2768,7 +2775,18 @@ export default function App() {
                   try {
                     const accounts: string[] = await (window as any).ethereum.request({ method: "eth_requestAccounts" });
                     if (!accounts[0]) return;
-                    const r: any = await apiFetch("/auth/wallet", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ walletAddress: accounts[0] }) });
+                    const userId = decodeJwtPayload(token ?? "").userId;
+                    if (!userId) throw new Error("Missing session user");
+                    const message = buildWalletLinkMessage(accounts[0], userId);
+                    const signature: string = await (window as any).ethereum.request({
+                      method: "personal_sign",
+                      params: [message, accounts[0]],
+                    });
+                    const r: any = await apiFetch("/auth/wallet", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ walletAddress: accounts[0], message, signature }),
+                    });
                     if (r.ok !== false) setUserWallet(accounts[0]);
                     else alert(r.error ?? "Failed to link wallet");
                   } catch (e: any) { alert(e?.message ?? "Connection cancelled"); }
