@@ -2679,7 +2679,7 @@ export default function App() {
           EXIT_ON_PROFIT_REVERSAL: 0.03,
         }),
       });
-      await apiFetch("/bot/start", { method: "POST" });
+      await apiFetch("/me/bot/start", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
@@ -2687,14 +2687,14 @@ export default function App() {
   async function handleStop() {
     setActionLoading(true);
     try {
-      await apiFetch("/bot/stop", { method: "POST" });
+      await apiFetch("/me/bot/stop", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
 
   async function handleSaveConfig(update: Partial<BotConfig>) {
-    await apiFetch("/bot/set", {
-      method: "POST",
+    await apiFetch("/me/bot/config", {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(update),
     });

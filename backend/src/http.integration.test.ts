@@ -112,3 +112,32 @@ test("POST /vault/send-to-wallet rejects anonymous callers", async () => {
   assert.equal(res.status, 401);
   assert.equal(res.body.error, "unauthorized");
 });
+
+test("PATCH /me/bot/config rejects anonymous callers", async () => {
+  const res = await invoke({
+    method: "PATCH",
+    path: "/me/bot/config",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ symbols: ["BTCUSDT"] }),
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});
+
+test("POST /me/bot/start rejects anonymous callers", async () => {
+  const res = await invoke({
+    method: "POST",
+    path: "/me/bot/start",
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});
+
+test("POST /me/bot/stop rejects anonymous callers", async () => {
+  const res = await invoke({
+    method: "POST",
+    path: "/me/bot/stop",
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});

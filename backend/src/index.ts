@@ -32,6 +32,12 @@ import {
   validateUserTradingConfig as validateUserTradingConfigInput,
 } from "./services/users/userTradingConfig.js";
 import {
+  getUserBotLaunchConfig,
+  type UserBotLaunchConfig,
+  patchUserBotLaunchConfig,
+  validateUserBotLaunchConfig,
+} from "./services/users/userBotLaunchConfig.js";
+import {
   sendVerificationEmail, sendApprovalEmail, sendRejectionEmail,
   sendAdminNewUserAlert,
 } from "./services/email/mailer.js";
@@ -183,6 +189,23 @@ async function resolveUserKey(
   } catch { /* non-fatal */ }
 
   return "";
+}
+
+async function getEffectiveBotLaunchConfig(userId?: string) {
+  const base = {
+    symbols: currentSymbols,
+    strategy: currentStrategy,
+    trigger: currentTrigger,
+  };
+
+  if (!userId) return base;
+
+  const saved: UserBotLaunchConfig = await getUserBotLaunchConfig(getRedis(), userId).catch(() => ({}));
+  return {
+    symbols: saved.symbols?.length ? saved.symbols : base.symbols,
+    strategy: saved.strategy ?? base.strategy,
+    trigger: { ...base.trigger, ...(saved.trigger ?? {}) },
+  };
 }
 
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
@@ -645,18 +668,22 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
 
       if (u.pathname === "/bot/config") {
         if (req.method === "GET" || req.method === "HEAD") {
+          const payload = decodeToken(req);
           const userKey = await resolveUserKey(req, u);
+          const effective = await getEffectiveBotLaunchConfig(payload?.userId);
           return json(res, 200, {
             userAddress: userKey,
-            symbols: currentSymbols,
-            strategy: currentStrategy,
-            trigger: currentTrigger,
+            symbols: effective.symbols,
+            strategy: effective.strategy,
+            trigger: effective.trigger,
           });
         }
       }
 
       if (u.pathname === "/bot/state") {
+        const payload = decodeToken(req);
         const userKey = await resolveUserKey(req, u);
+        const effective = await getEffectiveBotLaunchConfig(payload?.userId);
         const baseState = getState();
         const workerRunning = userKey ? workerPool.isRunning(userKey) : false;
         const workerStatus  = userKey ? workerPool.getUserStatus(userKey) : null;
@@ -664,9 +691,9 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           ok: true,
           config: {
             userAddress: userKey,
-            symbols: currentSymbols,
-            strategy: currentStrategy,
-            trigger: currentTrigger,
+            symbols: effective.symbols,
+            strategy: effective.strategy,
+            trigger: effective.trigger,
           },
           state: {
             ...baseState,
@@ -769,6 +796,84 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           return json(res, 200, { ok: true, config: validated });
         } catch (e: any) {
           return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      if (u.pathname === "/me/bot/config" && req.method === "GET") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const payload = decodeToken(req);
+        const userKey = await resolveUserKey(req, u);
+        const effective = await getEffectiveBotLaunchConfig(payload?.userId);
+        return json(res, 200, {
+          ok: true,
+          config: {
+            userAddress: userKey,
+            symbols: effective.symbols,
+            strategy: effective.strategy,
+            trigger: effective.trigger,
+          },
+        });
+      }
+
+      if (u.pathname === "/me/bot/config" && req.method === "PATCH") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const payload = decodeToken(req);
+        if (!payload?.userId) return json(res, 401, { ok: false, error: "unauthorized" });
+        try {
+          const body = await readJson(req);
+          const patch = validateUserBotLaunchConfig(body);
+          const saved = await patchUserBotLaunchConfig(getRedis(), payload.userId, patch);
+          const userKey = await resolveUserKey(req, u);
+          const effective = await getEffectiveBotLaunchConfig(payload.userId);
+          log.info({ userId: payload.userId, userKey, patch }, "[user] bot launch config updated");
+          return json(res, 200, {
+            ok: true,
+            saved,
+            config: {
+              userAddress: userKey,
+              symbols: effective.symbols,
+              strategy: effective.strategy,
+              trigger: effective.trigger,
+            },
+          });
+        } catch (e: any) {
+          return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
+        }
+      }
+
+      if (u.pathname === "/me/bot/start" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const payload = decodeToken(req);
+          const userKey = await resolveUserKey(req, u);
+          if (!payload?.userId || !userKey) return json(res, 400, { ok: false, error: "no user configured" });
+          const effective = await getEffectiveBotLaunchConfig(payload.userId);
+          const r = await workerPool.startUser({
+            userKey,
+            symbols: effective.symbols,
+            trigger: effective.trigger,
+            strategy: effective.strategy,
+            userId: payload.userId,
+          });
+          return json(res, r.ok ? 200 : 400, r);
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
+        }
+      }
+
+      if (u.pathname === "/me/bot/stop" && req.method === "POST") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        try {
+          const userKey = await resolveUserKey(req, u);
+          if (!userKey) return json(res, 400, { ok: false, error: "no user configured" });
+          const r = workerPool.stopUser(userKey);
+          return json(res, 200, r);
+        } catch (e: any) {
+          return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
       }
 
