@@ -2686,20 +2686,27 @@ export default function App() {
           MAX_LEVERAGE: launchLeverage,
           MANUAL_SIZE_PCT: sizeMode === "manual" ? manualSizePct / 100 : 0,
           VOTE_REQUIRED: 5,
-          MIN_PROFIT_BEFORE_REVERSAL: 0.30,
+          MIN_PROFIT_BEFORE_REVERSAL: 0.03,
           EXIT_ON_PROFIT_REVERSAL: 0.03,
+          PROFIT_LOCK_GATE: 0.30,
         }),
       });
-      await apiFetch("/me/bot/start", { method: "POST" });
+      const startRes: any = await apiFetch("/me/bot/start", { method: "POST" });
+      if (startRes?.ok === false) throw new Error(startRes.error ?? "Failed to start bot");
       await fetchState();
+    } catch (e: any) {
+      alert(e?.message ?? "Failed to start bot");
     } finally { setActionLoading(false); }
   }
 
   async function handleStop() {
     setActionLoading(true);
     try {
-      await apiFetch("/me/bot/stop", { method: "POST" });
+      const stopRes: any = await apiFetch("/me/bot/stop", { method: "POST" });
+      if (stopRes?.ok === false) throw new Error(stopRes.error ?? "Failed to stop bot");
       await fetchState();
+    } catch (e: any) {
+      alert(e?.message ?? "Failed to stop bot");
     } finally { setActionLoading(false); }
   }
 

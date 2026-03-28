@@ -921,7 +921,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           const userKey = await resolveUserKey(req, u);
           if (!userKey) return json(res, 400, { ok: false, error: "no user configured" });
           const r = workerPool.stopUser(userKey);
-          return json(res, 200, r);
+          return json(res, r.ok ? 200 : 409, r);
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
@@ -994,7 +994,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           const r = workerPool.stopUser(userKey);
           await getRedis().del("bot:engine:autostart");
           await auditLog(adminResult.userId, "pool:stop", userKey);
-          return json(res, 200, r);
+          return json(res, r.ok ? 200 : 409, r);
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
