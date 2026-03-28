@@ -40,6 +40,7 @@ export type CachedTrade = {
   entryPriceWad: string;       // bigint serialised as string
   bestPriceWad: string;        // bigint serialised as string — kline-confirmed trailing peak
   pendingBestWad?: string;     // bigint serialised as string — unconfirmed candidate (optional, defaults to bestPriceWad)
+  pendingBestSeenAtMs?: number;
   sizeWad: string;             // bigint serialised as string
   openedAtMs: number;
   pending: boolean;
