@@ -44,6 +44,16 @@ test("mini gate arms from live peak and exits in profit on reversal", () => {
   assert.equal(result.reason, "PROFIT_REVERSAL_MINI_GATE");
 });
 
+test("live peak tracking keeps best price aligned with favorable current price before mini gate", () => {
+  const trade = makeTrade();
+
+  maybeAdvanceLiveProfitPeak(trade as any, toWad(100.08), DEFAULT_CFG); // +0.08% raw = +0.8% lev at 10x
+  assert.equal(trade.bestPriceWad, toWad(100.08));
+
+  maybeAdvanceLiveProfitPeak(trade as any, toWad(100.15), DEFAULT_CFG); // +0.15% raw = +1.5% lev at 10x
+  assert.equal(trade.bestPriceWad, toWad(100.15));
+});
+
 test("staircase locks one step below a 9% leveraged peak", () => {
   const trade = makeTrade({ bestPriceWad: toWad(100.9) }); // +0.9% raw = +9% lev at 10x
 

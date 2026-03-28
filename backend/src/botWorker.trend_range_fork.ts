@@ -388,10 +388,13 @@ function hasMiniGateArmed(
 }
 
 export function maybeAdvanceLiveProfitPeak(t: ActiveTrade, price: Wad, cfg: BotConfig): void {
-  const liveMove = getLeveragedMoveWad(t, price);
-  const minGate = toWad(cfg.MIN_PROFIT_BEFORE_REVERSAL);
+  void cfg;
 
-  if (liveMove >= minGate && isMoreFavorablePrice(t, price, t.bestPriceWad)) {
+  // Keep the favorable live peak in sync immediately so trail telemetry never
+  // reports current leveraged PnL above the recorded best leveraged PnL.
+  // The staircase gate still arms only when bestMove crosses MIN_PROFIT_BEFORE_REVERSAL,
+  // but the peak itself should always reflect the best live price seen so far.
+  if (isMoreFavorablePrice(t, price, t.bestPriceWad)) {
     updateBest(t, price);
     return;
   }
