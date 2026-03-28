@@ -50,6 +50,8 @@ import { getSigner, getVaultWriteContract, getProvider, getVaultAddress } from "
 import { recordDeposit, recordWithdrawal, recordSubscriptionPayment, checkSubscription, getUserFeeStats, FEE } from "./services/fees/feeEngine.js";
 import { workerPool } from "./services/bot/workerPool.js";
 import { getCandleCacheStats } from "./services/market/binanceCandles.js";
+import { canOverrideUserQuery, hasValidAdminKeyHeader, validateWalletLinkMessage } from "./services/auth/security.js";
+import { adminRouteHttpStatus, buildRetiredRouteResponse } from "./services/auth/routePolicies.js";
 
 const PORT                = Number(process.env.PORT ?? "5050");
 const ADMIN_KEY           = process.env.ADMIN_KEY ?? "";               // kept for internal CLI only
@@ -58,6 +60,7 @@ const JWT_SECRET          = process.env.JWT_SECRET ?? "CHANGEME_REPLACE_BEFORE_L
 const LOGIN_PASSWORD_HASH = process.env.LOGIN_PASSWORD_HASH ?? "";
 const JWT_EXPIRES_IN      = "8h";
 const ADMIN_EMAIL         = process.env.ADMIN_EMAIL ?? "";
+const WALLET_LINK_PREFIX  = "UrumTrader wallet link";
 
 // ── In-memory rate limiter (login endpoint) ───────────────────────────────────
 const _rlMap = new Map<string, { count: number; resetAt: number }>();
@@ -192,15 +195,20 @@ async function auditLog(adminId: string, action: string, targetUserId: string, d
  */
 async function resolveUserKey(
   req: http.IncomingMessage,
-  u: URL
+  u: URL,
+  opts: { allowQueryOverride?: boolean } = {}
 ): Promise<string> {
+  const payload = decodeToken(req);
+
   // 1. Query param
   const q = u.searchParams.get("user");
-  if (q) return q;
+  if (q && opts.allowQueryOverride) {
+    const isPrivileged = canOverrideUserQuery(payload, hasValidAdminKey(req));
+    if (isPrivileged) return q;
+  }
 
   // 2. JWT
   try {
-    const payload = decodeToken(req);
     if (payload?.userId) {
       const user = await getUserById(getRedis(), payload.userId).catch(() => null);
       if (user?.walletAddress) return user.walletAddress;
@@ -212,10 +220,13 @@ async function resolveUserKey(
 }
 
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
+function hasValidAdminKey(req: http.IncomingMessage) {
+  return hasValidAdminKeyHeader(ADMIN_KEY, String(req.headers["x-admin-key"] ?? "") || undefined);
+}
+
 function requireAdmin(req: http.IncomingMessage) {
   if (!ADMIN_KEY) return null;
-  const key = String(req.headers["x-admin-key"] ?? "");
-  if (!key || key !== ADMIN_KEY) return "unauthorized";
+  if (!hasValidAdminKey(req)) return "unauthorized";
   return null;
 }
 
@@ -226,8 +237,7 @@ async function readJson(req: http.IncomingMessage) {
   return raw ? JSON.parse(raw) : {};
 }
 
-http
-  .createServer(async (req, res) => {
+export async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
     setCors(res);
     if (req.method === "OPTIONS") return res.end();
 
@@ -414,15 +424,25 @@ http
         try {
           const b = await readJson(req);
           const walletAddress = String(b.walletAddress ?? "").trim();
+          const message = String(b.message ?? "");
+          const signature = String(b.signature ?? "");
           if (!walletAddress || !/^0x[0-9a-fA-F]{40}$/.test(walletAddress))
             return json(res, 400, { ok: false, error: "Valid wallet address required" });
-          // Verify signature if provided
-          if (b.signature && b.message) {
-            const { ethers } = await import("ethers");
-            const recovered = ethers.verifyMessage(String(b.message), String(b.signature));
-            if (recovered.toLowerCase() !== walletAddress.toLowerCase())
-              return json(res, 400, { ok: false, error: "Signature verification failed" });
+          if (!message || !signature) {
+            return json(res, 400, { ok: false, error: "Wallet signature is required" });
           }
+          if (!validateWalletLinkMessage({
+            message,
+            walletAddress,
+            userId: payload.userId,
+            prefix: WALLET_LINK_PREFIX,
+          })) {
+            return json(res, 400, { ok: false, error: "Invalid wallet-link message" });
+          }
+          const { ethers } = await import("ethers");
+          const recovered = ethers.verifyMessage(message, signature);
+          if (recovered.toLowerCase() !== walletAddress.toLowerCase())
+            return json(res, 400, { ok: false, error: "Signature verification failed" });
           await updateUser(getRedis(), payload.userId, { walletAddress });
           return json(res, 200, { ok: true, walletAddress });
         } catch (e: any) {
@@ -670,10 +690,11 @@ http
       }
 
       if (u.pathname === "/bot/state") {
+        const userAddress = await resolveUserKey(req, u);
         return json(res, 200, {
           ok: true,
           config: {
-            userAddress: currentUserAddress,
+            userAddress,
             symbols: currentSymbols,
             strategy: currentStrategy,
             trigger: currentTrigger,
@@ -684,7 +705,10 @@ http
 
       // View vault balances (read-only)
       if (u.pathname === "/vault/balances") {
-        const user = u.searchParams.get("user") ?? currentUserAddress;
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const adminResult = await requireAdminRole(req);
+        const user = await resolveUserKey(req, u, { allowQueryOverride: !("error" in adminResult) });
         if (!user) return json(res, 400, { ok: false, error: "missing user" });
         const r = await getVaultBalances(user);
         return json(res, 200, { ok: true, user, balances: r });
@@ -692,8 +716,11 @@ http
 
       // Debug: see all open positions for a user
       if (u.pathname === "/vault/position") {
-        const user = u.searchParams.get("user") ?? currentUserAddress;
-        if (!user) return json(res, 400, { ok: false, error: "missing user" });
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
+        const adminResult = await requireAdminRole(req);
+        const user = await resolveUserKey(req, u, { allowQueryOverride: !("error" in adminResult) });
+        if (!user) return json(res, 400, { ok: false, error: "no user configured" });
         const c = getVaultReadContract();
         const markets: string[] = await c.getOpenMarkets(user);
         const positions: Record<string, any> = {};
@@ -712,8 +739,10 @@ http
       }
 
       if (u.pathname === "/bot/set" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) {
+          return json(res, adminRouteHttpStatus(adminResult.error as "unauthorized" | "forbidden" | "session expired"), { ok: false, error: adminResult.error });
+        }
         try {
           const b = await readJson(req);
           if (typeof b.userAddress === "string") currentUserAddress = b.userAddress;
@@ -732,6 +761,7 @@ http
             if (typeof t.stochMid === "number") currentTrigger.stochMid = t.stochMid;
             if (typeof t.stochDLen === "number") currentTrigger.stochDLen = t.stochDLen;
           }
+          await auditLog(adminResult.userId, "bot:set", currentUserAddress || "*", `symbols=${currentSymbols.join(",")}`);
           return json(res, 200, {
             ok: true,
             config: { userAddress: currentUserAddress, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
@@ -773,53 +803,21 @@ http
       // @deprecated — migrate to POST /pool/start. This route uses the global
       // currentUserAddress and is not safe for multi-user operation.
       if (u.pathname === "/bot/start") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
         res.setHeader("Deprecation", "true");
         res.setHeader("Sunset", "2026-12-31");
-        log.warn("[DEPRECATED] POST /bot/start — migrate to POST /pool/start");
-        if (!currentUserAddress) return json(res, 400, { ok: false, error: "Set TEST_USER_ADDRESS env or POST /bot/set" });
-        currentSymbols = normalizeSymbols(currentSymbols);
-        if (!currentSymbols.length) return json(res, 400, { ok: false, error: "no valid symbols configured" });
-
-        // ── Subscription gate ─────────────────────────────────────────────────
-        // Block the bot from starting if the user's subscription (or trial) has expired.
-        // Admins bypass the check — they can always start the engine.
-        const startPayload = decodeToken(req);
-        const startUserId  = startPayload?.userId ?? "legacy";
-        if (startUserId !== "legacy" && startPayload?.role !== "admin") {
-          const startUser = await getUserById(getRedis(), startUserId).catch(() => null);
-          const subStatus = await checkSubscription(
-            getRedis(), startUserId, startUser?.trialExpiresAt ?? null
-          );
-          if (!subStatus.active) {
-            return json(res, 403, {
-              ok: false,
-              error: "Subscription expired — please renew to continue trading",
-              subscriptionStatus: subStatus,
-              renewUrl: "/subscription/pay",
-            });
-          }
-        }
-
-        const r = await startBot({ userKey: currentUserAddress, symbols: currentSymbols, trigger: currentTrigger });
-        setRunning(true);
-        await persistEngineState(true);   // survive backend restart
-        return json(res, 200, r);
+        log.warn("[RETIRED] POST /bot/start called — use POST /pool/start");
+        const retired = buildRetiredRouteResponse(u.pathname)!;
+        return json(res, retired.status, retired.body);
       }
 
       // @deprecated — migrate to POST /pool/stop. This route uses the global
       // currentUserAddress and is not safe for multi-user operation.
       if (u.pathname === "/bot/stop") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
         res.setHeader("Deprecation", "true");
         res.setHeader("Sunset", "2026-12-31");
-        log.warn("[DEPRECATED] POST /bot/stop — migrate to POST /pool/stop");
-        const r = stopBot();
-        setRunning(false);
-        await persistEngineState(false);  // clear autostart flag
-        return json(res, 200, r);
+        log.warn("[RETIRED] POST /bot/stop called — use POST /pool/stop");
+        const retired = buildRetiredRouteResponse(u.pathname)!;
+        return json(res, retired.status, retired.body);
       }
 
       // ── POST /pool/start — start bot for a specific user (admin) ─────────
@@ -902,12 +900,13 @@ http
 
       // ── Close all open on-chain positions (admin) ─────────────────────────
       if (u.pathname === "/bot/closeall" && req.method === "POST") {
-        // Accept either JWT bearer token OR X-Admin-Key header
-        const adminKeyErr = requireAdmin(req);
-        const jwtErr      = requireAuth(req);
-        if (adminKeyErr !== null && jwtErr !== null) return json(res, 401, { ok: false, error: "unauthorized" });
+        const adminResult = await requireAdminRole(req);
+        const legacyAdmin = hasValidAdminKey(req);
+        if (!legacyAdmin && "error" in adminResult) {
+          return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        }
         try {
-          const user = await resolveUserKey(req, u);
+          const user = await resolveUserKey(req, u, { allowQueryOverride: true });
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
           const readC  = getVaultReadContract();
           const markets: string[] = await readC.getOpenMarkets(user);
@@ -952,6 +951,9 @@ http
           }
 
           const closed = results.filter(r => r.ok).length;
+          if (!legacyAdmin && !("error" in adminResult)) {
+            await auditLog(adminResult.userId, "bot:closeall", user, `closed=${closed}/${markets.length}`);
+          }
           return json(res, 200, { ok: true, closed, total: markets.length, results });
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
@@ -960,12 +962,18 @@ http
 
       // ── Close a single position by symbol ────────────────────────────────
       if (u.pathname === "/vault/close-position" && req.method === "POST") {
+        const adminResult = await requireAdminRole(req);
+        const legacyAdmin = hasValidAdminKey(req);
+        const authErr = requireAuth(req);
+        if (authErr && !legacyAdmin) return json(res, 401, { ok: false, error: authErr });
         try {
           const b: any = await readJson(req);
           const symbol: string | undefined = b?.symbol?.toUpperCase();
           if (!symbol) return json(res, 400, { ok: false, error: "symbol required" });
 
-          const user = await resolveUserKey(req, u);
+          const user = await resolveUserKey(req, u, {
+            allowQueryOverride: legacyAdmin || !("error" in adminResult),
+          });
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           const { symbolToMarketId } = await import("./services/onchain/vaultAdapter.js");
@@ -1195,9 +1203,12 @@ http
 
       // ── GET /vault/wallet-balance — wallet USDC + vault + fees + pending ──────
       if (u.pathname === "/vault/wallet-balance") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
         try {
-          const user = u.searchParams.get("user") ?? currentUserAddress;
-          if (!user) return json(res, 400, { ok: false, error: "missing user" });
+          const adminResult = await requireAdminRole(req);
+          const user = await resolveUserKey(req, u, { allowQueryOverride: !("error" in adminResult) });
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
           const STABLE_DECIMALS = Number(process.env.STABLE_DECIMALS ?? "6");
           const readC = getVaultReadContract();
 
@@ -1308,8 +1319,10 @@ http
       // ── POST /vault/send-to-wallet — transfer USDC from bot signer to any address ─
       // Used to move "Wallet Balance" (held at bot signer address) to user's MetaMask.
       if (u.pathname === "/vault/send-to-wallet" && req.method === "POST") {
-        const err = requireAuth(req);
-        if (err) return json(res, 401, { ok: false, error: err });
+        const adminResult = await requireAdminRole(req);
+        if ("error" in adminResult) {
+          return json(res, adminResult.error === "unauthorized" ? 401 : 403, { ok: false, error: adminResult.error });
+        }
         try {
           const b           = await readJson(req);
           const toAddress: string = String(b.toAddress ?? "").trim();
@@ -1331,6 +1344,7 @@ http
           const tx = await (stable as any).transfer(toAddress, amountRaw);
           const receipt = await waitWithFallback(tx);
 
+          await auditLog(adminResult.userId, "vault:send-to-wallet", toAddress, `amount=${amountUsdc}`);
           log.info({ toAddress, amountUsdc, txHash: receipt.hash }, "[vault] send-to-wallet ✓");
           return json(res, 200, { ok: true, txHash: receipt.hash, amount: amountUsdc, toAddress });
         } catch (e: any) {
@@ -1351,7 +1365,7 @@ http
           const signer   = getSigner();
           const writeC   = getVaultWriteContract();
           const readC    = getVaultReadContract();
-          const user     = currentUserAddress;
+          const user     = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           // Resolve amount: number or "all"
@@ -1441,7 +1455,7 @@ http
           const netAmountRaw = BigInt(b.netAmountRaw); // net after platform fee, as string
           const grossAmount  = parseFloat(b.grossAmount);
           const mode         = (b.mode ?? "normal") as "normal" | "emergency";
-          const user         = currentUserAddress;
+          const user         = await resolveUserKey(req, u);
           if (!user) return json(res, 400, { ok: false, error: "no user configured" });
 
           const signer  = getSigner();
@@ -1486,8 +1500,9 @@ http
           const grossAmount = parseFloat(b.grossAmount);
           const txHash      = b.txHash as string;
           const readC       = getVaultReadContract();
-          const user        = currentUserAddress;
-          const stableX18: bigint = await readC.stableBalanceX18(user ?? "");
+          const user        = await resolveUserKey(req, u);
+          if (!user) return json(res, 400, { ok: false, error: "no user configured" });
+          const stableX18: bigint = await readC.stableBalanceX18(user);
           const vaultBalanceUsdc   = +(Number(stableX18) / 1e18).toFixed(6);
           const fees = await recordWithdrawal(getRedis(), userId, grossAmount, vaultBalanceUsdc, "emergency", txHash);
           return json(res, 200, { ok: true, txHash, fees });
@@ -1564,8 +1579,11 @@ http
         let openPositions = 0;
         try {
           const c = getVaultReadContract();
-          const markets: string[] = await (c as any).getOpenMarkets(currentUserAddress);
-          openPositions = Array.isArray(markets) ? markets.length : 0;
+          const userKey = await resolveUserKey(req, u);
+          if (userKey) {
+            const markets: string[] = await (c as any).getOpenMarkets(userKey);
+            openPositions = Array.isArray(markets) ? markets.length : 0;
+          }
         } catch { /* */ }
         return json(res, 200, {
           ok: true,
@@ -1609,8 +1627,14 @@ http
       Sentry.captureException(e);
       return json(res, 500, { ok: false, error: e?.message ?? "internal error" });
     }
-  })
-  .listen(PORT, async () => {
+}
+
+export function createHttpServer() {
+  return http.createServer(handleRequest);
+}
+
+if (process.env.BACKEND_DISABLE_AUTO_START !== "1") {
+  createHttpServer().listen(PORT, async () => {
     try {
       // ── Startup sequence ─────────────────────────────────────────────────────
       // 1. Connect Redis
@@ -1654,6 +1678,7 @@ http
       log.error({ err: e?.message }, "[server] startup error");
     }
   });
+}
 
 // ── Global safety net ─────────────────────────────────────────────────────────
 process.on("uncaughtException", (err: any) => {
