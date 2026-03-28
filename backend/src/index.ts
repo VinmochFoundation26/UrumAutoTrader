@@ -208,6 +208,44 @@ async function getEffectiveBotLaunchConfig(userId?: string) {
   };
 }
 
+const USER_RUNTIME_CONFIG_KEYS = [
+  "DEFAULT_LEVERAGE",
+  "MAX_LEVERAGE",
+  "MANUAL_SIZE_PCT",
+  "VOTE_REQUIRED",
+  "MIN_PROFIT_BEFORE_REVERSAL",
+  "EXIT_ON_PROFIT_REVERSAL",
+  "STOP_LOSS_PCT",
+  "COOLDOWN_SECONDS",
+  "ATR_PERIOD",
+  "ATR_VOLATILITY_THRESHOLD",
+] as const;
+
+function hasUserRuntimeConfigPatch(raw: Record<string, unknown>) {
+  return USER_RUNTIME_CONFIG_KEYS.some((key) => raw[key] !== undefined);
+}
+
+async function patchUserRuntimeConfig(userKey: string, raw: Record<string, unknown>, activeSymbols: string[]) {
+  const redis = getRedis();
+  const existing = await (async () => {
+    try {
+      const s = await redis.get(CFG_KEYS.user(userKey));
+      return s ? JSON.parse(s) : {};
+    } catch {
+      return {};
+    }
+  })();
+  const merged = { ...existing, ...raw };
+  const validated = validateConfig(merged);
+  for (const sym of activeSymbols) {
+    const cap = symbolMaxLev(sym);
+    if (validated.DEFAULT_LEVERAGE > cap) validated.DEFAULT_LEVERAGE = cap;
+    if (validated.MAX_LEVERAGE > cap) validated.MAX_LEVERAGE = cap;
+  }
+  await redis.set(CFG_KEYS.user(userKey), JSON.stringify(validated));
+  return validated;
+}
+
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
 function hasValidAdminKey(req: http.IncomingMessage) {
   return hasValidAdminKeyHeader(ADMIN_KEY, String(req.headers["x-admin-key"] ?? "") || undefined);
@@ -668,6 +706,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
 
       if (u.pathname === "/bot/config") {
         if (req.method === "GET" || req.method === "HEAD") {
+          const authErr = requireAuth(req);
+          if (authErr) return json(res, 401, { ok: false, error: authErr });
           const payload = decodeToken(req);
           const userKey = await resolveUserKey(req, u);
           const effective = await getEffectiveBotLaunchConfig(payload?.userId);
@@ -681,6 +721,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
       }
 
       if (u.pathname === "/bot/state") {
+        const authErr = requireAuth(req);
+        if (authErr) return json(res, 401, { ok: false, error: authErr });
         const payload = decodeToken(req);
         const userKey = await resolveUserKey(req, u);
         const effective = await getEffectiveBotLaunchConfig(payload?.userId);
@@ -823,14 +865,22 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         if (!payload?.userId) return json(res, 401, { ok: false, error: "unauthorized" });
         try {
           const body = await readJson(req);
+          const userKey = await resolveUserKey(req, u);
+          if (!userKey) return json(res, 400, { ok: false, error: "no user configured" });
+
           const patch = validateUserBotLaunchConfig(body);
           const saved = await patchUserBotLaunchConfig(getRedis(), payload.userId, patch);
-          const userKey = await resolveUserKey(req, u);
+          let runtimeConfig: any = undefined;
+          if (hasUserRuntimeConfigPatch(body)) {
+            const nextSymbols = patch.symbols?.length ? patch.symbols : (saved.symbols?.length ? saved.symbols : currentSymbols);
+            runtimeConfig = await patchUserRuntimeConfig(userKey, body, nextSymbols);
+          }
           const effective = await getEffectiveBotLaunchConfig(payload.userId);
           log.info({ userId: payload.userId, userKey, patch }, "[user] bot launch config updated");
           return json(res, 200, {
             ok: true,
             saved,
+            runtimeConfig,
             config: {
               userAddress: userKey,
               symbols: effective.symbols,

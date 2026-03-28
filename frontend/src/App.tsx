@@ -2667,8 +2667,8 @@ export default function App() {
     setActionLoading(true);
     try {
       // Push leverage + sizing + strategy params into bot config before starting
-      await apiFetch("/bot/config", {
-        method: "POST",
+      await apiFetch("/me/bot/config", {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           DEFAULT_LEVERAGE: launchLeverage,

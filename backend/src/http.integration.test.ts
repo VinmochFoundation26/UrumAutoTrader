@@ -124,6 +124,24 @@ test("PATCH /me/bot/config rejects anonymous callers", async () => {
   assert.equal(res.body.error, "unauthorized");
 });
 
+test("GET /bot/config rejects anonymous callers", async () => {
+  const res = await invoke({
+    method: "GET",
+    path: "/bot/config",
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});
+
+test("GET /bot/state rejects anonymous callers", async () => {
+  const res = await invoke({
+    method: "GET",
+    path: "/bot/state",
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, "unauthorized");
+});
+
 test("POST /me/bot/start rejects anonymous callers", async () => {
   const res = await invoke({
     method: "POST",
