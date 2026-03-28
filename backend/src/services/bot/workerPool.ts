@@ -24,8 +24,8 @@
  *   workerPool.getStatus();
  */
 
-import { BotWorkerInstance }    from "./botWorkerInstance.js";
-import type { TriggerConfig }   from "./botWorkerInstance.js";
+import { BotWorkerInstance }              from "./botWorkerInstance.js";
+import type { TriggerConfig, StrategyMode } from "./botWorkerInstance.js";
 import { makeEngineDeps }       from "./deps.js";
 import { checkSubscription }    from "../fees/feeEngine.js";
 import { getUserById }          from "../users/userStore.js";
@@ -45,6 +45,8 @@ export type StartWorkerArgs = {
   symbols:           string[];
   /** Optional strategy tuning overrides. */
   trigger?:          TriggerConfig;
+  /** Strategy mode — defaults to "trend_range_fork". */
+  strategy?:         StrategyMode;
   /** Redis user ID (UUID from userStore) — used for subscription check. */
   userId?:           string;
   /** ISO timestamp of trial expiry from user record. */
@@ -70,7 +72,7 @@ class WorkerPool {
     error?:               string;
     subscriptionRequired?: boolean;
   }> {
-    const { userKey, symbols, trigger = {}, userId, trialExpiresAt, skipSubCheck = false } = args;
+    const { userKey, symbols, trigger = {}, strategy = "trend_range_fork", userId, trialExpiresAt, skipSubCheck = false } = args;
 
     // ── Pool capacity guard ────────────────────────────────────────────────
     if (this.pool.size >= MAX_WORKERS && !this.pool.has(userKey)) {
@@ -106,7 +108,7 @@ class WorkerPool {
 
     if (!instance) {
       const deps = makeEngineDeps();
-      instance   = new BotWorkerInstance(userKey, symbols, trigger, deps);
+      instance   = new BotWorkerInstance(userKey, symbols, trigger, deps, strategy);
       this.pool.set(userKey, instance);
     } else if (instance.isRunning()) {
       // Already running — return current status without restarting

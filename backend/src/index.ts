@@ -41,7 +41,7 @@ import { connectRedis, disconnectRedis, getRedis } from "./services/cache/redis.
 import { restoreEventHistory } from "./services/bot/state.js";
 import { startPriceStream, stopPriceStream, getLatestPrice, getAllPrices, updateStreamSymbols } from "./services/market/priceStream.js";
 import { assertOnchainReady, getVaultReadContract } from "./services/onchain/contractInstance.js";
-import { startEngine, stopEngine } from "./services/bot/runner.js";
+import { stopEngine } from "./services/bot/runner.js";
 import { getState, setRunning, recordError, addSseClient, getEventHistory } from "./services/bot/state.js";
 import { getVaultBalances } from "./services/onchain/vaultViews.js";
 import { validateConfig, CFG_KEYS, symbolMaxLev } from "./botWorker.trend_range_fork.js";
@@ -79,11 +79,6 @@ setInterval(() => {
   for (const [k, v] of _rlMap) if (now > v.resetAt) _rlMap.delete(k);
 }, 5 * 60_000).unref();
 
-// @deprecated — global mutable user address. Use JWT-derived userKey or ?user= param.
-// Will be removed once all routes migrate to resolveUserKey().
-// Prefer TEST_USER_ADDRESS, but keep TEST_USER_KEY for backward compatibility
-let currentUserAddress = process.env.TEST_USER_ADDRESS ?? process.env.TEST_USER_KEY ?? "";
-
 // Source of truth: SYMBOLS only (no whitelist)
 let currentSymbols: string[] = (process.env.SYMBOLS ?? "ETHUSDT")
   .split(",")
@@ -100,33 +95,6 @@ let currentTrigger = {
   stochMid: Number(process.env.STOCH_MID ?? "50"),
   stochDLen: Number(process.env.STOCH_D_LEN ?? "3"),
 };
-
-// Redis key for persisting engine run state across restarts
-const REDIS_ENGINE_KEY = "bot:engine:autostart";
-
-async function persistEngineState(running: boolean) {
-  try {
-    const redis = getRedis();
-    if (running) {
-      await redis.set(REDIS_ENGINE_KEY, JSON.stringify({
-        running: true,
-        userKey: currentUserAddress,
-        symbols: currentSymbols,
-        trigger: currentTrigger,
-        savedAt: Date.now(),
-      }));
-    } else {
-      await redis.del(REDIS_ENGINE_KEY);
-    }
-  } catch { /* non-fatal */ }
-}
-
-async function startBot(args: { userKey: string; symbols: string[]; trigger?: typeof currentTrigger }) {
-  return await startEngine(args);
-}
-function stopBot() {
-  return stopEngine();
-}
 
 function normalizeSymbols(list: any): string[] {
   const arr = Array.isArray(list)
@@ -189,9 +157,8 @@ async function auditLog(adminId: string, action: string, targetUserId: string, d
 
 /**
  * Resolves the active userKey for a request using priority:
- *   1. ?user= query param (allowed for admin only in production)
+ *   1. ?user= query param
  *   2. JWT-derived wallet address from the authenticated user record
- *   3. currentUserAddress fallback (deprecated)
  */
 async function resolveUserKey(
   req: http.IncomingMessage,
@@ -211,12 +178,11 @@ async function resolveUserKey(
   try {
     if (payload?.userId) {
       const user = await getUserById(getRedis(), payload.userId).catch(() => null);
-      if (user?.walletAddress) return user.walletAddress;
+      if (user?.walletAddress) return user.walletAddress.toLowerCase();
     }
   } catch { /* non-fatal */ }
 
-  // 3. Fallback
-  return currentUserAddress;
+  return "";
 }
 
 /** Legacy ADMIN_KEY check — kept only for internal CLI scripts */
@@ -690,16 +656,23 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
       }
 
       if (u.pathname === "/bot/state") {
-        const userAddress = await resolveUserKey(req, u);
+        const userKey = await resolveUserKey(req, u);
+        const baseState = getState();
+        const workerRunning = userKey ? workerPool.isRunning(userKey) : false;
+        const workerStatus  = userKey ? workerPool.getUserStatus(userKey) : null;
         return json(res, 200, {
           ok: true,
           config: {
-            userAddress,
+            userAddress: userKey,
             symbols: currentSymbols,
             strategy: currentStrategy,
             trigger: currentTrigger,
           },
-          state: getState(),
+          state: {
+            ...baseState,
+            running:   workerRunning,
+            startedAt: workerStatus?.startedAt ?? baseState.startedAt,
+          },
         });
       }
 
@@ -745,8 +718,6 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         }
         try {
           const b = await readJson(req);
-          if (typeof b.userAddress === "string") currentUserAddress = b.userAddress;
-          if (typeof b.userKey === "string") currentUserAddress = b.userKey;
           if (b.symbols != null) {
             const next = normalizeSymbols(b.symbols);
             if (!next.length) return json(res, 400, { ok: false, error: "no valid symbols after normalization" });
@@ -761,10 +732,11 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
             if (typeof t.stochMid === "number") currentTrigger.stochMid = t.stochMid;
             if (typeof t.stochDLen === "number") currentTrigger.stochDLen = t.stochDLen;
           }
-          await auditLog(adminResult.userId, "bot:set", currentUserAddress || "*", `symbols=${currentSymbols.join(",")}`);
+          const userKey = await resolveUserKey(req, u);
+          await auditLog(adminResult.userId, "bot:set", userKey || "*", `symbols=${currentSymbols.join(",")}`);
           return json(res, 200, {
             ok: true,
-            config: { userAddress: currentUserAddress, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
+            config: { userAddress: userKey, symbols: currentSymbols, strategy: currentStrategy, trigger: currentTrigger },
           });
         } catch (e: any) {
           return json(res, 400, { ok: false, error: e?.message ?? "bad request" });
@@ -801,7 +773,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
       }
 
       // @deprecated — migrate to POST /pool/start. This route uses the global
-      // currentUserAddress and is not safe for multi-user operation.
+      // @retired — use POST /pool/start. The old /bot/start route is intentionally disabled
+      // to avoid reintroducing single-user route semantics.
       if (u.pathname === "/bot/start") {
         res.setHeader("Deprecation", "true");
         res.setHeader("Sunset", "2026-12-31");
@@ -810,8 +783,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         return json(res, retired.status, retired.body);
       }
 
-      // @deprecated — migrate to POST /pool/stop. This route uses the global
-      // currentUserAddress and is not safe for multi-user operation.
+      // @retired — use POST /pool/stop. The old /bot/stop route is intentionally disabled
+      // to avoid reintroducing single-user route semantics.
       if (u.pathname === "/bot/stop") {
         res.setHeader("Deprecation", "true");
         res.setHeader("Sunset", "2026-12-31");
@@ -831,6 +804,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           const rawSyms   = b.symbols ?? currentSymbols;
           const symbols   = normalizeSymbols(rawSyms);
           const trigger   = b.trigger ?? currentTrigger;
+          const strategy  = (b.strategy ?? "trend_range_fork") as import("./services/bot/botWorkerInstance.js").StrategyMode;
 
           if (!userKey) return json(res, 400, { ok: false, error: "userKey required" });
           if (!symbols.length) return json(res, 400, { ok: false, error: "at least one symbol required" });
@@ -839,9 +813,13 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
             userKey,
             symbols,
             trigger,
+            strategy,
             userId:        userId  || undefined,
             skipSubCheck:  !userId,   // skip if no userId provided (admin override)
           });
+          if (r.ok) {
+            await getRedis().set("bot:engine:autostart", JSON.stringify({ running: true, userKey, symbols, trigger, strategy }));
+          }
           await auditLog(adminResult.userId, "pool:start", userKey, `symbols=${symbols.join(",")}`);
           return json(res, r.ok ? 200 : 400, r);
         } catch (e: any) {
@@ -859,6 +837,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           if (!userKey) return json(res, 400, { ok: false, error: "userKey required" });
 
           const r = workerPool.stopUser(userKey);
+          await getRedis().del("bot:engine:autostart");
           await auditLog(adminResult.userId, "pool:stop", userKey);
           return json(res, 200, r);
         } catch (e: any) {
@@ -1011,8 +990,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         // Determine userKey for filtering:
         // 1. Admin/support role → use "*" (all events) or ?userKey= param
         // 2. User role → derive from JWT-linked wallet address
-        // 3. No token → fallback to currentUserAddress (backward compat)
-        let sseUserKey: string = currentUserAddress || "*";
+        // 3. No token → show all events ("*")
+        let sseUserKey: string = "*";
         const ssePayload = decodeToken(req);
         if (ssePayload?.userId) {
           if (ssePayload.role === "admin" || ssePayload.role === "support") {
@@ -1022,8 +1001,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
             // Regular user: look up wallet address from user record
             try {
               const sseUser = await getUserById(getRedis(), ssePayload.userId).catch(() => null);
-              sseUserKey = sseUser?.walletAddress || currentUserAddress || "*";
-            } catch { /* non-fatal — fall back to currentUserAddress */ }
+              sseUserKey = sseUser?.walletAddress || "*";
+            } catch { /* non-fatal */ }
           }
         }
 
@@ -1110,6 +1089,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         const { getRedis } = await import("./services/cache/redis.js");
         const limit = Math.min(Number(u.searchParams.get("limit") ?? "200"), 2000);
         const userKey = await resolveUserKey(req, u);
+        if (!userKey) return json(res, 401, { ok: false, error: "authentication required" });
         const trades = await loadClosedTrades(getRedis(), userKey, limit);
         // Also compute summary metrics over all closed trades
         const { computeMetrics } = await import("./services/backtest/metrics.js");
@@ -1168,6 +1148,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         const { checkCircuitBreaker, getDailyReturn } = await import("./services/bot/drawdownGuard.js");
         const maxLoss    = Math.abs(Number(process.env.MAX_DAILY_LOSS_PCT ?? "0.10"));
         const userKey    = await resolveUserKey(req, u);
+        if (!userKey) return json(res, 401, { ok: false, error: "authentication required" });
         const cb         = await checkCircuitBreaker(getRedis(), userKey, maxLoss);
         const dailyReturn = await getDailyReturn(getRedis(), userKey);
         return json(res, 200, {
@@ -1190,6 +1171,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         if (err) return json(res, 401, { ok: false, error: err });
         const { resetCircuitBreaker } = await import("./services/bot/drawdownGuard.js");
         const userKey = await resolveUserKey(req, u);
+        if (!userKey) return json(res, 401, { ok: false, error: "authentication required" });
         await resetCircuitBreaker(getRedis(), userKey);
         return json(res, 200, { ok: true, message: "Circuit breaker reset for today" });
       }
@@ -1231,8 +1213,11 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
             readC.emergencyFeeBps() as Promise<bigint>,
           ]);
 
-          // Wallet balance (raw USDC in wallet, not yet deposited)
-          const wallet = await getWalletStableBalance(getProvider(), stableAddr, user, STABLE_DECIMALS);
+          // Wallet balance — shows the bot signer's USDC balance, since deposit
+          // uses the bot signer wallet (getSigner()) to approve + depositStable.
+          // User must first transfer USDC to the bot signer address before depositing.
+          const signerAddress = getSigner().address;
+          const wallet = await getWalletStableBalance(getProvider(), stableAddr, signerAddress, STABLE_DECIMALS);
 
           const BPS_DENOM = 10_000n;
           const fmtX18 = (x: bigint) => +(Number(x) / 1e18).toFixed(2);
@@ -1592,7 +1577,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
             redis: { status: redisOk ? "operational" : "degraded" },
             chain: { status: chainOk ? "operational" : "degraded", blockNumber },
           },
-          openPositions,
+          activeWorkers: workerPool.size,
           timestamp: Date.now(),
         });
       }
@@ -1652,21 +1637,21 @@ if (process.env.BACKEND_DISABLE_AUTO_START !== "1") {
       // 5. Auto-restart engine if it was running before crash/restart
       try {
         const redis = getRedis();
-        const saved = await redis.get(REDIS_ENGINE_KEY);
+        const saved = await redis.get("bot:engine:autostart");
         if (saved) {
           const s = JSON.parse(saved);
           if (s.running && s.userKey) {
-            // Restore symbols/trigger from saved state (user may not be at dashboard)
             if (Array.isArray(s.symbols) && s.symbols.length) currentSymbols = s.symbols;
             if (s.trigger) currentTrigger = s.trigger;
-            // Sync price stream to the restored symbol list — the stream was started
-            // at step 3 with the process.env.SYMBOLS default, which may differ from
-            // what was saved in Redis (e.g. after a symbol swap via dashboard/Redis).
             updateStreamSymbols(currentSymbols);
-            log.info({ symbols: currentSymbols }, "[server] auto-resuming engine after restart");
-            // Use workerPool.startUser() for multi-user safe restart
-            await workerPool.startUser({ userKey: s.userKey, symbols: currentSymbols, trigger: currentTrigger, skipSubCheck: true });
-            setRunning(true);
+            log.info({ userKey: s.userKey, symbols: currentSymbols }, "[server] auto-resuming engine after restart");
+            await workerPool.startUser({
+              userKey: s.userKey,
+              symbols: currentSymbols,
+              trigger: currentTrigger,
+              strategy: s.strategy ?? "trend_range_fork",
+              skipSubCheck: true,
+            });
           }
         }
       } catch (e: any) {
@@ -1710,6 +1695,7 @@ process.on("unhandledRejection", (reason: any) => {
 process.on("SIGTERM", async () => {
   log.info("[process] SIGTERM received — shutting down");
   stopPriceStream();
+  workerPool.stopAll();
   stopEngine();
   await disconnectRedis();
   process.exit(0);
@@ -1718,6 +1704,7 @@ process.on("SIGTERM", async () => {
 process.on("SIGINT", async () => {
   log.info("[process] SIGINT received — shutting down");
   stopPriceStream();
+  workerPool.stopAll();
   stopEngine();
   await disconnectRedis();
   process.exit(0);

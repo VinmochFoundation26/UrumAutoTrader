@@ -378,11 +378,15 @@ export async function startEngine(args: {
     //
     // Spam prevention: the CIRCUIT_BREAKER_TRIGGERED event is emitted only once
     // per UTC date (tracked by lastCircuitBreakerDate) rather than every tick.
+    // When triggered: block NEW entries only — exit monitoring still runs.
+    // Returning here would leave open positions without stop-loss protection.
+    let circuitBreakerActive = false;
     if (deps.redis) {
       try {
         const maxLoss = Math.abs(Number(process.env.MAX_DAILY_LOSS_PCT ?? "0.10"));
         const cb = await checkCircuitBreaker(deps.redis, userKey, maxLoss);
         if (cb.triggered) {
+          circuitBreakerActive = true;
           if (lastCircuitBreakerDate !== cb.date) {
             lastCircuitBreakerDate = cb.date;
             deps.emit({
@@ -395,7 +399,7 @@ export async function startEngine(args: {
               reason: `Daily levered loss ${(cb.dailyReturn * 100).toFixed(1)}% exceeded limit ${(cb.limit * 100).toFixed(1)}%`,
             });
           }
-          return; // skip scan tick — engine stays alive, auto-resumes at UTC midnight
+          // Do NOT return — fall through so exit checks still run for open positions
         }
       } catch (e: any) {
         log.warn({ err: e?.message }, "[runner] circuit breaker check failed (non-fatal)");
@@ -574,8 +578,8 @@ try {
     // re-calling evaluateUserSymbol. Re-evaluation fails because the scan phase
     // already mutated the shared stoch state (prevK/prevD), causing crossUp/leftOS
     // to evaluate as impossible (K==K), so triggerOk is always false on the second pass.
-    if (atCapacity) {
-      return { paper: true, reason: `max capacity (${openCount}/${userMaxConcurrent}); entry disabled` };
+    if (atCapacity || circuitBreakerActive) {
+      return { paper: true, reason: atCapacity ? `max capacity (${openCount}/${userMaxConcurrent}); entry disabled` : "circuit breaker active; new entries blocked" };
     }
 
     // ── Slippage guard ───────────────────────────────────────────────────────

@@ -710,43 +710,27 @@ function adx(
 
 // ---------- exits ----------
 //
-// 2-phase best-price confirmation.
-//
-// WHY: the kline scanner uses the current IN-PROGRESS 5m candle's close price,
-// which is the real-time market price.  A micro-spike can cause that price to
-// briefly exceed the gate (5% lev) and then immediately reverse — in the same
-// 10-second scanner interval.  If we advanced bestPriceWad the instant a spike
-// was seen, the trailing-stop floor would be anchored to the spike, and the
-// NEXT tick's WS-based fast exit monitor would fire far below the gate (e.g.
-// at +0.49% lev instead of +5%).
-//
-// HOW: bestPriceWad only advances from pendingBestWad when the NEXT scanner
-// call confirms the price is STILL at or above the pending candidate.
-//   Spike scenario:
-//     Tick T   : price=5.01% lev → pendingBestWad=5.01% (bestPriceWad stays at 0%)
-//     Tick T+10: price=0.94% lev → 0.94 < pending(5.01) → NOT confirmed; bestPriceWad=0%
-//     Fast monitor fires: bestMove=0% < gate → no exit ← CORRECT, trade continues
-//
-//   Genuine move scenario:
-//     Tick T   : price=5.01% lev → pendingBestWad=5.01% (bestPriceWad stays at 0%)
-//     Tick T+10: price=5.08% lev → 5.08 >= pending(5.01) → CONFIRMED; bestPriceWad=5.01%
-//     pendingBestWad updated to 5.08% for next round
-//     Fast monitor fires at 4.9%: bestMove=5.01% >= gate → exit at 4.9% ← CORRECT
+// Advance bestPriceWad directly from the kline extreme (HIGH for LONG, LOW for SHORT).
+// We use settled OHLCV candle data here — not raw WS tick prices — so a single-candle
+// peak is reliable and does not need multi-tick confirmation.
+// The old 2-phase confirmation (pendingBestWad → bestPriceWad on next tick) was designed
+// to filter WS micro-spikes, but those never reach this function (the fast monitor passes
+// advanceBestPrice=false and never calls updateBest).  The 2-phase logic caused the trailing
+// stop to silently fail whenever a peak-and-reverse happened in a single 10s window: the
+// pending candidate was set but never confirmed, so bestPriceWad stayed at entry forever and
+// bestMove stayed 0%, meaning the trailing gate never armed.
 //
 function updateBest(t: ActiveTrade, price: Wad): void {
   if (t.isLong) {
-    // Phase 1: promote pendingBestWad → bestPriceWad if price is still holding at/above it
-    if (t.pendingBestWad > t.bestPriceWad && price >= t.pendingBestWad) {
-      t.bestPriceWad = t.pendingBestWad;
+    if (price > t.bestPriceWad) {
+      t.bestPriceWad  = price;
+      t.pendingBestWad = price; // keep in sync for Redis persistence / compat
     }
-    // Phase 2: set new pending if current price exceeds the current pending candidate
-    if (price > t.pendingBestWad) t.pendingBestWad = price;
   } else {
-    // Short: mirror logic — lower prices are "better"
-    if (t.pendingBestWad < t.bestPriceWad && price <= t.pendingBestWad) {
-      t.bestPriceWad = t.pendingBestWad;
+    if (price < t.bestPriceWad) {
+      t.bestPriceWad  = price;
+      t.pendingBestWad = price;
     }
-    if (price < t.pendingBestWad) t.pendingBestWad = price;
   }
 }
 
@@ -754,27 +738,10 @@ function movePctWad(t: ActiveTrade, price: Wad): Wad {
   return t.isLong ? divWad(price - t.entryPriceWad, t.entryPriceWad) : divWad(t.entryPriceWad - price, t.entryPriceWad);
 }
 
-// advanceBestPrice controls whether updateBest() is called:
-//   true  (default) — used by the 10s kline scanner; advances bestPriceWad from
-//                     kline extremes (HIGH for LONG, LOW for SHORT) when available,
-//                     falling back to close price.
-//   false           — used by the 500ms fast exit monitor; checks the trailing stop
-//                     against the ALREADY-ESTABLISHED bestPriceWad without advancing
-//                     it from raw WS tick prices.
-//
-// candleExtreme (optional): kline HIGH for LONG trades, kline LOW for SHORT trades.
-//   When provided (scanner path), bestPriceWad is advanced from the intra-candle
-//   extreme rather than just the close — this captures peaks that closed lower
-//   (e.g. BTC spikes to +9% lev mid-candle but closes at +4.5% lev; without the
-//   HIGH the trail gate would never activate and the +9% gain would silently erode).
-//   Falls back to close price when ohlcv is unavailable (e.g. REST fetch error).
-//
-// Why this matters: WS book-ticker prices include micro-spikes that can briefly
-// exceed the gate (5% lev) and immediately reverse.  If the fast monitor were
-// allowed to advance bestPriceWad from such a spike, the effective floor would
-// be locked to the spike price and the next tick's exit would fire far below the
-// gate (e.g. +0.49% lev instead of +5%).  Kline extremes are settled OHLCV values
-// and are safe to use as best-price anchors.
+// advanceBestPrice is kept for API compatibility but is no longer used inside
+// shouldExit — bestPriceWad is now advanced by an explicit updateBest() call in
+// the scanner BEFORE shouldExit is called.  The fast monitor still passes false
+// (it must never advance bestPriceWad from raw WS tick prices).
 function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 0, advanceBestPrice = true, candleExtreme?: Wad): boolean {
   const rawMove = movePctWad(t, price); // raw price % (no leverage), direction-aware
 
@@ -806,12 +773,8 @@ function shouldExit(t: ActiveTrade, price: Wad, cfg: BotConfig, currentAtrPct = 
   const stop = toWad(rawStopNum);
   if (rawMove <= -stop) return true;
 
-  // Only advance bestPriceWad when called from the kline scanner (advanceBestPrice=true).
-  // Use the kline extreme (HIGH for LONG, LOW for SHORT) when available — this
-  // captures intra-candle peaks that the close price alone would miss.
-  // The fast monitor passes advanceBestPrice=false to prevent WS micro-spikes
-  // from anchoring the trail gate.
-  if (advanceBestPrice) updateBest(t, candleExtreme ?? price);
+  // bestPriceWad is advanced by an explicit updateBest() call in the scanner loop
+  // before shouldExit is called, so there is nothing to do here.
 
   // ── 2. Two-gate ratcheting staircase (LEVERAGED PnL terms) ──────────────────
   //
@@ -896,9 +859,9 @@ export async function fastExitCheck(
 
   // ── Minimum hold time guard (fast monitor) ─────────────────────────────────
   // Mirror the 60-second hold window used by the 10s kline scanner.
-  // The fast monitor must not fire the trailing stop before 60s either;
-  // the scanner advances bestPriceWad during the hold window, which would
-  // let the fast monitor trigger exits at 0% PnL on any brief price dip.
+  // The scanner now advances bestPriceWad even during the hold window (to capture
+  // early peaks), but the trailing exit must still wait 60 s to avoid exiting at
+  // 0% on a brief pullback immediately after entry.
   // Hard stop-loss (rawMove ≤ -stop) is still allowed to fire immediately.
   const fastHeldMs  = Date.now() - t.openedAtMs;
   const MIN_HOLD_MS = 60_000;
@@ -1474,32 +1437,32 @@ export async function evaluateUserSymbol(
       : undefined;
 
     // ── Trailing-stop minimum hold time ─────────────────────────────────────
-    // Prevent the profit-reversal trailing stop from triggering in the first
-    // 60 seconds after entry.  On volatile 5m candles a +0.5% tick followed by
-    // a pullback to entry would otherwise promote bestPriceWad to the gate level
-    // (5–10% lev) and immediately exit at 0% PnL.
+    // Prevent the profit-reversal trailing stop from EXITING in the first 60 s.
+    // bestPriceWad is still advanced during the hold window (see updateBest call
+    // below) so any peak that occurs in the first 60 s is captured and used the
+    // moment trailReady flips true.
     // The hard stop-loss (rawMove ≤ -stop) is still allowed to fire at any age —
-    // those protect against sudden crashes where waiting 60s is dangerous.
+    // those protect against sudden crashes where waiting 60 s is dangerous.
     const trailHeldMs   = Date.now() - t.openedAtMs;
     const MIN_TRAIL_MS  = 60_000; // 60 seconds
     const trailReady    = trailHeldMs >= MIN_TRAIL_MS;
 
-    // Always advance bestPriceWad from kline data (needed for later ticks), but
-    // only call shouldExit for the trailing-stop gate once the hold time has passed.
-    // Hard stop (rawMove ≤ -stop) is checked separately and fires immediately.
+    // Always advance bestPriceWad from the kline extreme, even during the hold window.
+    // Peaks that occur in the first 60 s are now tracked correctly so the trailing
+    // floor is ready the moment the hold window expires.  The trailing EXIT itself
+    // is still gated by trailReady (and the fast monitor has its own 60 s guard),
+    // so no premature exits can happen — we just stop losing peak information.
+    updateBest(t, candleExtreme ?? priceWad);
+
     const rawMoveCheck  = movePctWad(t, priceWad);
     const rawStopImm    = t.leverage >= 40
       ? Math.max(0.005, Math.min(0.008, 0.30 / t.leverage))
       : cfg.STOP_LOSS_PCT;
     const hardStopNow   = rawMoveCheck <= -toWad(rawStopImm);
 
-    // Do NOT advance bestPriceWad during the hold window.
-    // Advancing it would pre-arm the trailing-stop gate so the fast monitor
-    // (50ms) could trigger an exit at 0% PnL on any brief dip below the gate.
-    // After the 60s window opens, shouldExit() advances bestPriceWad normally
-    // (advanceBestPrice=true), building up the trailing level from scratch.
-
-    if (hardStopNow || (trailReady && shouldExit(t, priceWad, cfg, liveAtrPct, true, candleExtreme))) {
+    // advanceBestPrice=false: bestPriceWad already updated above; pass false so
+    // shouldExit does not attempt a redundant second advance.
+    if (hardStopNow || (trailReady && shouldExit(t, priceWad, cfg, liveAtrPct, false, candleExtreme))) {
       t.closing = true; // guard: prevents fast-exit monitor from double-closing
       emit(deps, { type: "EXIT_SIGNAL", userKey, symbol, timeframe, reason: "risk_exit" });
 
@@ -1515,7 +1478,11 @@ export async function evaluateUserSymbol(
           emit(deps, { type: "GHOST_TRADE_CLEARED", userKey, symbol, timeframe });
           return;
         }
-        throw closeErr; // re-throw all other errors (tx failure, network, etc.)
+        // Close failed (tx error, network, etc.) — reset closing flag so the
+        // next scan tick retries.  Without this reset, t.closing stays true
+        // permanently and the exit block is skipped on every future tick.
+        t.closing = false;
+        throw closeErr;
       }
 
       // Capture PnL before deleting (for performance history)

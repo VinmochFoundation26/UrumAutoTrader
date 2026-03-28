@@ -9,52 +9,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: backend/package-lock.json
-
-      # ── Backend ──────────────────────────────────────────────────────────────
-      - name: Install backend dependencies
-        working-directory: backend
-        run: npm ci
-
-      - name: Build backend TypeScript
-        working-directory: backend
-        run: npm run build
-
-      # ── Frontend ─────────────────────────────────────────────────────────────
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
-        env:
-          VITE_API_URL: /api
-          VITE_USER_ADDRESS: "0xbb75Bd3585DD162bd18b08501757B7371218af85"
-
-      # ── Package & Deploy ─────────────────────────────────────────────────────
-      - name: Package all dist files
-        run: |
-          mkdir -p /tmp/deploy-pkg/frontend
-          cp -r backend/dist backend/package.json backend/package-lock.json backend/Dockerfile /tmp/deploy-pkg/
-          cp -r frontend/dist /tmp/deploy-pkg/frontend/
-          tar -czf /tmp/deploy.tar.gz -C /tmp/deploy-pkg .
-
-      - name: Deploy via webhook
+      - name: Trigger deploy on VPS
         run: |
           STATUS=$(curl -s -o /tmp/deploy-response.txt -w "%{http_code}" \
             -X POST \
             -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @/tmp/deploy.tar.gz \
-            --max-time 120 \
+            --max-time 180 \
             https://urumtrader.com/deploy-hook)
           echo "Response: $(cat /tmp/deploy-response.txt)"
           echo "HTTP Status: $STATUS"
@@ -63,3 +23,4 @@ jobs:
             exit 1
           fi
           echo "Deploy successful!"
+

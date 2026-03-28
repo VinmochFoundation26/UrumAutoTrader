@@ -696,6 +696,374 @@ function PerformancePanel({ data, loading, err, onRefresh }: {
   );
 }
 
+// ── Analytics Panel ───────────────────────────────────────────────────────────
+// Advanced portfolio analytics: equity curve, symbol breakdown, PnL histogram,
+// streak analysis, and extended risk ratios (Sortino, Calmar, Recovery Factor).
+
+function EquityCurve({ trades }: { trades: ClosedTradeRecord[] }) {
+  if (trades.length < 2) return (
+    <div className="chart-empty">Not enough trades for equity curve (need ≥ 2)</div>
+  );
+
+  const sorted = [...trades].sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0));
+
+  // Build cumulative levered PnL series
+  let cum = 0;
+  const points: { x: number; y: number }[] = [{ x: 0, y: 0 }];
+  sorted.forEach((t, i) => {
+    cum += (t.pnlPct ?? 0) * (t.leverage ?? 10);
+    points.push({ x: i + 1, y: cum });
+  });
+
+  const W = 560, H = 160, PAD = { t: 12, r: 12, b: 28, l: 52 };
+  const iW = W - PAD.l - PAD.r;
+  const iH = H - PAD.t - PAD.b;
+
+  const minY = Math.min(...points.map(p => p.y));
+  const maxY = Math.max(...points.map(p => p.y));
+  const rangeY = maxY - minY || 1;
+  const maxX   = points.length - 1 || 1;
+
+  const toSvgX = (x: number) => PAD.l + (x / maxX) * iW;
+  const toSvgY = (y: number) => PAD.t + iH - ((y - minY) / rangeY) * iH;
+
+  const polyline = points.map(p => `${toSvgX(p.x)},${toSvgY(p.y)}`).join(" ");
+  const lastP    = points[points.length - 1]!;
+  const lastSvgY = toSvgY(lastP.y);
+  const isProfit = lastP.y >= 0;
+
+  // Y-axis ticks (5 levels)
+  const yTicks = Array.from({ length: 5 }, (_, i) => {
+    const v = minY + (rangeY / 4) * i;
+    return { y: v, svgY: toSvgY(v) };
+  });
+
+  return (
+    <div className="chart-container">
+      <div className="chart-title">Equity Curve (Levered PnL)</div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="equity-svg">
+        {/* Zero baseline */}
+        {minY < 0 && maxY > 0 && (
+          <line
+            x1={PAD.l} y1={toSvgY(0)} x2={W - PAD.r} y2={toSvgY(0)}
+            stroke="var(--muted)" strokeWidth={1} strokeDasharray="4 3"
+          />
+        )}
+        {/* Y-axis labels */}
+        {yTicks.map((t, i) => (
+          <text key={i} x={PAD.l - 6} y={t.svgY + 4} textAnchor="end"
+            fontSize={9} fill="var(--muted)">
+            {t.y >= 0 ? "+" : ""}{(t.y * 100).toFixed(0)}%
+          </text>
+        ))}
+        {/* Grid lines */}
+        {yTicks.map((t, i) => (
+          <line key={i} x1={PAD.l} y1={t.svgY} x2={W - PAD.r} y2={t.svgY}
+            stroke="var(--border)" strokeWidth={0.5} />
+        ))}
+        {/* Fill area */}
+        <polygon
+          points={`${toSvgX(0)},${toSvgY(0)} ${polyline} ${toSvgX(maxX)},${toSvgY(0)}`}
+          fill={isProfit ? "rgba(52,211,153,0.08)" : "rgba(239,68,68,0.08)"}
+        />
+        {/* Equity line */}
+        <polyline points={polyline} fill="none"
+          stroke={isProfit ? "var(--green)" : "var(--red)"} strokeWidth={2}
+          strokeLinejoin="round" strokeLinecap="round"
+        />
+        {/* X-axis */}
+        <text x={PAD.l} y={H - 6} fontSize={9} fill="var(--muted)">Trade 1</text>
+        <text x={W - PAD.r} y={H - 6} fontSize={9} fill="var(--muted)" textAnchor="end">
+          Trade {trades.length}
+        </text>
+        {/* Last value label */}
+        <text x={toSvgX(maxX) + 4} y={lastSvgY + 4} fontSize={10}
+          fill={isProfit ? "var(--green)" : "var(--red)"} fontWeight="600">
+          {lastP.y >= 0 ? "+" : ""}{(lastP.y * 100).toFixed(1)}%
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+function PnlHistogram({ trades }: { trades: ClosedTradeRecord[] }) {
+  if (!trades.length) return null;
+  const vals = trades.map(t => (t.pnlPct ?? 0) * (t.leverage ?? 10) * 100);
+  const min  = Math.floor(Math.min(...vals));
+  const max  = Math.ceil(Math.max(...vals));
+  const bucketCount = Math.min(20, Math.max(8, trades.length));
+  const step = (max - min) / bucketCount || 1;
+
+  const buckets: { label: string; count: number; isPos: boolean }[] = Array.from({ length: bucketCount }, (_, i) => {
+    const lo = min + i * step, hi = lo + step;
+    return {
+      label: `${lo.toFixed(0)}%`,
+      count: vals.filter(v => v >= lo && (i === bucketCount - 1 ? v <= hi : v < hi)).length,
+      isPos: lo >= 0,
+    };
+  });
+
+  const maxCount = Math.max(...buckets.map(b => b.count), 1);
+  const W = 560, H = 140, PAD = { t: 10, r: 12, b: 28, l: 32 };
+  const iW = W - PAD.l - PAD.r;
+  const iH = H - PAD.t - PAD.b;
+  const bW  = iW / bucketCount;
+
+  return (
+    <div className="chart-container">
+      <div className="chart-title">PnL Distribution</div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="equity-svg">
+        {buckets.map((b, i) => {
+          const bH   = (b.count / maxCount) * iH;
+          const bX   = PAD.l + i * bW + 1;
+          const bY   = PAD.t + iH - bH;
+          return (
+            <g key={i}>
+              <rect x={bX} y={bY} width={Math.max(bW - 2, 1)} height={bH}
+                fill={b.isPos ? "rgba(52,211,153,0.55)" : "rgba(239,68,68,0.55)"}
+                rx={1}
+              />
+              {b.count > 0 && bH > 14 && (
+                <text x={bX + (bW - 2) / 2} y={bY + 11} textAnchor="middle"
+                  fontSize={9} fill="var(--text)">{b.count}</text>
+              )}
+            </g>
+          );
+        })}
+        {/* X-axis labels (every 4 buckets) */}
+        {buckets.map((b, i) => i % 4 === 0 && (
+          <text key={i} x={PAD.l + i * bW + bW / 2} y={H - 6}
+            textAnchor="middle" fontSize={9} fill="var(--muted)">{b.label}</text>
+        ))}
+        {/* Zero line */}
+        {buckets.some(b => !b.isPos) && buckets.some(b => b.isPos) && (
+          <line
+            x1={PAD.l + buckets.findIndex(b => b.isPos) * bW}
+            y1={PAD.t} x2={PAD.l + buckets.findIndex(b => b.isPos) * bW} y2={PAD.t + iH}
+            stroke="var(--muted)" strokeWidth={1} strokeDasharray="3 2"
+          />
+        )}
+      </svg>
+    </div>
+  );
+}
+
+function AnalyticsPanel({ data, loading, err, onRefresh }: {
+  data: PerfData | null;
+  loading: boolean;
+  err: string | null;
+  onRefresh: () => void;
+}) {
+  if (loading) return <div className="empty-state"><Spinner /><p>Loading analytics…</p></div>;
+  if (err)     return <div className="empty-state"><AlertTriangle size={24} /><p>{err}</p><button className="sym-refresh" onClick={onRefresh}><RefreshCw size={12} /> Retry</button></div>;
+  if (!data || data.count === 0) return (
+    <div className="empty-state">
+      <BarChart2 size={32} className="empty-icon" />
+      <p>No trade data yet</p>
+      <span>Analytics will populate once the bot closes positions.</span>
+      <button className="sym-refresh" style={{ marginTop: 12 }} onClick={onRefresh}><RefreshCw size={12} /> Check Now</button>
+    </div>
+  );
+
+  const { metrics, trades } = data;
+  const sorted = [...trades].sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0));
+
+  // ── Extended risk metrics ─────────────────────────────────────────────────
+  const levReturns = sorted.map(t => (t.pnlPct ?? 0) * (t.leverage ?? 10));
+  const totalReturn = levReturns.reduce((a, b) => a + b, 0);
+  const avgReturn   = levReturns.length ? totalReturn / levReturns.length : 0;
+
+  // Sortino — downside deviation (using 0 as target)
+  const downside = levReturns.filter(r => r < 0);
+  const downsideDev = downside.length
+    ? Math.sqrt(downside.reduce((a, r) => a + r * r, 0) / downside.length)
+    : 0;
+  const sortino = downsideDev > 0 ? avgReturn / downsideDev : 0;
+
+  // Calmar — annualised return / max drawdown (approximate with total/maxDD)
+  const calmar = metrics.maxDrawdown > 0 ? totalReturn / metrics.maxDrawdown : 0;
+
+  // Recovery Factor — total profit / max drawdown
+  const totalProfit = levReturns.reduce((a, r) => a + Math.max(0, r), 0);
+  const recovery    = metrics.maxDrawdown > 0 ? totalProfit / metrics.maxDrawdown : 0;
+
+  // ── Streak analysis ───────────────────────────────────────────────────────
+  let curStreak = 0, maxWin = 0, maxLoss = 0, streakType: "W" | "L" | null = null;
+  for (const t of sorted) {
+    const win = (t.pnlPct ?? 0) >= 0;
+    if (streakType === null) { streakType = win ? "W" : "L"; curStreak = 1; }
+    else if ((win && streakType === "W") || (!win && streakType === "L")) { curStreak++; }
+    else { streakType = win ? "W" : "L"; curStreak = 1; }
+    if (streakType === "W") maxWin  = Math.max(maxWin, curStreak);
+    else                    maxLoss = Math.max(maxLoss, curStreak);
+  }
+  const curStreakLabel = curStreak > 0 && streakType
+    ? `${curStreak} ${streakType === "W" ? "Wins" : "Losses"}`
+    : "—";
+
+  // ── Per-symbol breakdown ──────────────────────────────────────────────────
+  const bySymbol = new Map<string, { wins: number; losses: number; totalLev: number; count: number }>();
+  for (const t of trades) {
+    const sym = t.symbol ?? "?";
+    const entry = bySymbol.get(sym) ?? { wins: 0, losses: 0, totalLev: 0, count: 0 };
+    const win   = (t.pnlPct ?? 0) >= 0;
+    entry.wins    += win ? 1 : 0;
+    entry.losses  += win ? 0 : 1;
+    entry.totalLev += (t.pnlPct ?? 0) * (t.leverage ?? 10);
+    entry.count   += 1;
+    bySymbol.set(sym, entry);
+  }
+
+  // ── Per-strategy breakdown ────────────────────────────────────────────────
+  const byStrategy = new Map<string, { wins: number; losses: number; totalLev: number; count: number }>();
+  for (const t of (trades as any[])) {
+    const strat = (t as any).strategy ?? "trend_range_fork";
+    const entry = byStrategy.get(strat) ?? { wins: 0, losses: 0, totalLev: 0, count: 0 };
+    const win   = (t.pnlPct ?? 0) >= 0;
+    entry.wins    += win ? 1 : 0;
+    entry.losses  += win ? 0 : 1;
+    entry.totalLev += (t.pnlPct ?? 0) * (t.leverage ?? 10);
+    entry.count   += 1;
+    byStrategy.set(strat, entry);
+  }
+
+  // ── Avg duration by side ──────────────────────────────────────────────────
+  const longTrades  = trades.filter(t => t.isLong);
+  const shortTrades = trades.filter(t => !t.isLong);
+  const avgDurLong  = longTrades.length  ? longTrades.reduce((a, t) => a + (t.durationMs ?? 0), 0) / longTrades.length : 0;
+  const avgDurShort = shortTrades.length ? shortTrades.reduce((a, t) => a + (t.durationMs ?? 0), 0) / shortTrades.length : 0;
+
+  const fmtPctA = (v: number) => (v >= 0 ? "+" : "") + (v * 100).toFixed(1) + "%";
+
+  return (
+    <div className="analytics-panel">
+      {/* Equity Curve */}
+      <EquityCurve trades={sorted} />
+
+      {/* Risk Metrics */}
+      <div className="analytics-section-title">Extended Risk Metrics</div>
+      <div className="metrics-grid">
+        <MetricCard label="Sortino Ratio"    value={sortino.toFixed(2)}  color={sortino >= 1 ? "green" : "red"} />
+        <MetricCard label="Calmar Ratio"     value={calmar.toFixed(2)}   color={calmar >= 1 ? "green" : "red"} />
+        <MetricCard label="Recovery Factor"  value={recovery.toFixed(2)} color={recovery >= 1 ? "green" : "red"} />
+        <MetricCard label="Avg Trade (lev)"  value={fmtPctA(avgReturn)}  color={avgReturn >= 0 ? "green" : "red"} />
+        <MetricCard label="Total Return"     value={fmtPctA(totalReturn)} color={totalReturn >= 0 ? "green" : "red"} />
+        <MetricCard label="Avg Win"
+          value={fmtPctA(levReturns.filter(r => r >= 0).reduce((a, b) => a + b, 0) / Math.max(metrics.winCount, 1))}
+          color="green" />
+        <MetricCard label="Avg Loss"
+          value={fmtPctA(levReturns.filter(r => r < 0).reduce((a, b) => a + b, 0) / Math.max(metrics.lossCount, 1))}
+          color="red" />
+        <MetricCard label="Win/Loss Ratio"
+          value={(metrics.winCount / Math.max(metrics.lossCount, 1)).toFixed(2)}
+          color={metrics.winCount >= metrics.lossCount ? "green" : "red"} />
+      </div>
+
+      {/* Streak */}
+      <div className="analytics-section-title">Streak Analysis</div>
+      <div className="metrics-grid">
+        <MetricCard label="Current Streak" value={curStreakLabel}
+          color={streakType === "W" ? "green" : streakType === "L" ? "red" : undefined} />
+        <MetricCard label="Max Win Streak"  value={`${maxWin} W`}  color="green" />
+        <MetricCard label="Max Loss Streak" value={`${maxLoss} L`} color="red" />
+        <MetricCard label="LONG Trades"     value={String(longTrades.length)} />
+        <MetricCard label="SHORT Trades"    value={String(shortTrades.length)} />
+        <MetricCard label="Avg LONG Dur"    value={fmtDuration(avgDurLong)} />
+        <MetricCard label="Avg SHORT Dur"   value={fmtDuration(avgDurShort)} />
+        <MetricCard label="Avg Duration"    value={fmtDuration(metrics.avgDurationMs)} />
+      </div>
+
+      {/* PnL Histogram */}
+      <PnlHistogram trades={sorted} />
+
+      {/* Per-Symbol Breakdown */}
+      {bySymbol.size > 1 && (
+        <>
+          <div className="analytics-section-title">Performance by Symbol</div>
+          <div className="analytics-table">
+            <div className="analytics-table-header">
+              <span>Symbol</span><span>Trades</span><span>Win Rate</span><span>Total PnL (lev)</span>
+            </div>
+            {[...bySymbol.entries()].sort((a, b) => b[1].totalLev - a[1].totalLev).map(([sym, s]) => {
+              const wr = s.wins / s.count;
+              const lev = s.totalLev;
+              return (
+                <div className="analytics-table-row" key={sym}>
+                  <span style={{ fontWeight: 600 }}>{sym}</span>
+                  <span>{s.count}</span>
+                  <span className={wr >= 0.5 ? "pnl-pos" : "pnl-neg"}>{(wr * 100).toFixed(0)}%</span>
+                  <span className={lev >= 0 ? "pnl-pos" : "pnl-neg"}>{lev >= 0 ? "+" : ""}{(lev * 100).toFixed(1)}%</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {/* Per-Strategy Breakdown */}
+      {byStrategy.size > 1 && (
+        <>
+          <div className="analytics-section-title">Performance by Strategy</div>
+          <div className="analytics-table">
+            <div className="analytics-table-header">
+              <span>Strategy</span><span>Trades</span><span>Win Rate</span><span>Total PnL (lev)</span>
+            </div>
+            {[...byStrategy.entries()].sort((a, b) => b[1].totalLev - a[1].totalLev).map(([strat, s]) => {
+              const wr = s.wins / s.count;
+              const lev = s.totalLev;
+              return (
+                <div className="analytics-table-row" key={strat}>
+                  <span style={{ fontWeight: 600 }}>{strat.replace(/_/g, " ")}</span>
+                  <span>{s.count}</span>
+                  <span className={wr >= 0.5 ? "pnl-pos" : "pnl-neg"}>{(wr * 100).toFixed(0)}%</span>
+                  <span className={lev >= 0 ? "pnl-pos" : "pnl-neg"}>{lev >= 0 ? "+" : ""}{(lev * 100).toFixed(1)}%</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+        <button className="sym-refresh" onClick={onRefresh}><RefreshCw size={12} /> Refresh</button>
+      </div>
+    </div>
+  );
+}
+
+// ── PerfTabView — toggles Summary ↔ Analytics ────────────────────────────────
+
+function PerfTabView({ data, loading, err, onRefresh }: {
+  data: PerfData | null;
+  loading: boolean;
+  err: string | null;
+  onRefresh: () => void;
+}) {
+  const [view, setView] = useState<"summary" | "analytics">("summary");
+  return (
+    <div>
+      <div className="perf-subtab-nav">
+        <button
+          className={`perf-subtab-btn ${view === "summary" ? "perf-subtab-active" : ""}`}
+          onClick={() => setView("summary")}
+        >
+          <BarChart2 size={13} /> Summary
+        </button>
+        <button
+          className={`perf-subtab-btn ${view === "analytics" ? "perf-subtab-active" : ""}`}
+          onClick={() => setView("analytics")}
+        >
+          <TrendingUp size={13} /> Analytics
+        </button>
+      </div>
+      {view === "summary"
+        ? <PerformancePanel data={data} loading={loading} err={err} onRefresh={onRefresh} />
+        : <AnalyticsPanel   data={data} loading={loading} err={err} onRefresh={onRefresh} />
+      }
+    </div>
+  );
+}
+
 // ── Backtest Panel ────────────────────────────────────────────────────────────
 
 function BacktestPanel({ defaultSymbols }: { defaultSymbols: string[] }) {
@@ -2311,7 +2679,7 @@ export default function App() {
           EXIT_ON_PROFIT_REVERSAL: 0.03,
         }),
       });
-      await apiFetch("/bot/start");
+      await apiFetch("/bot/start", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
@@ -2319,7 +2687,7 @@ export default function App() {
   async function handleStop() {
     setActionLoading(true);
     try {
-      await apiFetch("/bot/stop");
+      await apiFetch("/bot/stop", { method: "POST" });
       await fetchState();
     } finally { setActionLoading(false); }
   }
@@ -2897,7 +3265,7 @@ export default function App() {
 
         {activeTab === "performance" && (
           <Card title="Live Performance" icon={<TrendingUp size={16} />}>
-            <PerformancePanel
+            <PerfTabView
               data={perfData}
               loading={perfLoading}
               err={perfErr}
