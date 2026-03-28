@@ -274,12 +274,17 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
       if (u.pathname === "/health") {
         let redisOk = false;
         try { await getRedis().ping(); redisOk = true; } catch { /* non-fatal */ }
+        const activeWorkers = workerPool.size;
+        const workerPoolRunning = workerPool.hasActiveWorkers;
         return json(res, 200, {
           ok: true,
           version: "1.1.0",
           uptime: Math.floor(process.uptime()),
           redis: redisOk ? "ok" : "degraded",
-          bot: getState().running ? "running" : "stopped",
+          bot: workerPoolRunning ? "running" : (getState().running ? "running" : "stopped"),
+          activeWorkers,
+          workerPoolRunning,
+          legacyBotRunning: getState().running,
           ts: Date.now(),
         });
       }
@@ -1728,7 +1733,13 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         return json(res, 200, {
           ok: true,
           services: {
-            bot:   { status: botState.running ? "operational" : "stopped", running: botState.running },
+            bot:   {
+              status: workerPool.hasActiveWorkers || botState.running ? "operational" : "stopped",
+              running: workerPool.hasActiveWorkers || botState.running,
+              activeWorkers: workerPool.size,
+              workerPoolRunning: workerPool.hasActiveWorkers,
+              legacyBotRunning: botState.running,
+            },
             redis: { status: redisOk ? "operational" : "degraded" },
             chain: { status: chainOk ? "operational" : "degraded", blockNumber },
           },
