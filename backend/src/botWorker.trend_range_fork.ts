@@ -1251,6 +1251,10 @@ function computeVotesFork(
     e20_5m != null && e20_5m_prev != null && prevLast != null &&
     last < e20_5m && prevLast < e20_5m_prev;              // required for SHORT
 
+  const e50_5m        = ema(closes, 50);
+  const emaStackLong  = e50_5m != null && e20_5m != null && e20_5m > e50_5m;
+  const emaStackShort = e50_5m != null && e20_5m != null && e20_5m < e50_5m;
+
   // Volume confirmation (5m): volume >= 60% of 20-bar average (was 80%).
   // Lowered threshold because pullbacks in healthy trends often occur on lower volume —
   // requiring 80% was blocking valid trend-following entries. Volume is used as a
@@ -1261,6 +1265,33 @@ function computeVotesFork(
   // RSI divergence bonus votes (adds 1 bonus vote when divergence is detected)
   const bullDiv = rsiBullishDivergence(closes, 14, 15);
   const bearDiv = rsiBearishDivergence(closes, 14, 15);
+
+  // ── Shared structure/quality guards (5m) ──────────────────────────────────
+  let adxVal: number | null = null;
+  if (ohlcv && ohlcv.highs.length >= 30) {
+    const adxResult = adx(ohlcv.highs, ohlcv.lows, ohlcv.closes);
+    adxVal = adxResult?.adx ?? null;
+  }
+  const longAdxOk  = adxVal == null || adxVal >= 20;
+  const shortAdxOk = adxVal == null || adxVal >= 20;
+  const rangeAdxOk = adxVal == null || adxVal < 20;
+
+  let atrExpanding = false;
+  {
+    const atrNow = atrClose(closes, 14);
+    if (atrNow != null) {
+      const prevAtrs: number[] = [];
+      for (let i = 1; i <= 5; i++) {
+        const a = atrClose(closes.slice(0, closes.length - i), 14);
+        if (a != null) prevAtrs.push(a);
+      }
+      if (prevAtrs.length >= 3) {
+        const atrAvg = prevAtrs.reduce((a, b) => a + b, 0) / prevAtrs.length;
+        atrExpanding = atrNow > atrAvg * 1.30;
+      }
+    }
+  }
+  const atrGuardOk = !atrExpanding;
 
   // ── Support / Resistance structure bonus votes ───────────────────────────
   // Detect swing highs and swing lows from the last 50 candles.
@@ -1307,9 +1338,10 @@ function computeVotesFork(
       if (pullbackOk) longVotes += 1;
       // triggerOk: classic stoch cross OR momentum continuation.
       // crossUp/leftOS = ideal pullback entry from oversold.
-      // momentumOk = stoch K above D and above 40 while RSI had a pullback — valid
-      // in strong trends where stoch stays elevated and never revisits OS territory.
-      const momentumOk = d != null && k > d && k >= 40 && pullbackOk;
+      // momentumOk = stoch K above D, above 50, and RSI rising — stricter than
+      // the earlier pullback-based momentum shortcut, so longs only fire when
+      // positive momentum is already clearly established.
+      const momentumOk = d != null && k > d && k >= 50 && rsiRising;
       const triggerOk = crossUp || leftOS || momentumOk;
       if (triggerOk) longVotes += 2;
       const timingOk = rsiRising;
@@ -1320,9 +1352,19 @@ function computeVotesFork(
       if (atSupport) longVotes += 1;         // price at swing-low support (+1 bonus)
 
       const triggerSrc = crossUp ? "crossUp" : leftOS ? "leftOS" : momentumOk ? "momentum" : "none";
-      const reason = `Trend LONG (regime). pullbackOk=${pullbackOk} triggerOk=${triggerOk}(${triggerSrc}) rsiRising=${timingOk} ema20gate=${priceAboveEma20} volOk=${volOk} bullDiv=${bullDiv} atSupport=${atSupport} votes=${longVotes}/${required}`;
+      const reason =
+        `Trend LONG (regime). pullbackOk=${pullbackOk} triggerOk=${triggerOk}(${triggerSrc}) ` +
+        `rsiRising=${timingOk} ema20=${priceAboveEma20} ` +
+        `emaStack=${emaStackLong} adx=${adxVal != null ? adxVal.toFixed(1) : "n/a"}(ok=${longAdxOk}) ` +
+        `atrExpanding=${atrExpanding}(ok=${atrGuardOk}) ` +
+        `volOk=${volOk} bullDiv=${bullDiv} atSupport=${atSupport} votes=${longVotes}/${required}`;
       decided =
-        triggerOk && longVotes >= required && longVotes > shortVotes
+        triggerOk          &&
+        longVotes >= required &&
+        longVotes > shortVotes &&
+        emaStackLong       &&
+        longAdxOk          &&
+        atrGuardOk
           ? "LONG" : "NONE";
 
       return { decided, votes: { longVotes, shortVotes, required, mode, trendRegime: t, rsiValue: r, stochK: k, stochD: d ?? undefined, reason } };
@@ -1355,46 +1397,6 @@ function computeVotesFork(
       // ADX 20–25 = emerging downtrend → allowed.
       // ADX ≥ 25 = strong downtrend → ideal.
       // Permissive when OHLCV unavailable (don't block on missing data).
-      let adxVal: number | null = null;
-      if (ohlcv && ohlcv.highs.length >= 30) {
-        const adxResult = adx(ohlcv.highs, ohlcv.lows, ohlcv.closes);
-        adxVal = adxResult?.adx ?? null;
-      }
-      const adxOk = adxVal == null || adxVal >= 20;
-
-      // ── Guard 3: EMA stack alignment (5m bearish stack) ─────────────────────
-      // Require 5m EMA20 < EMA50 (short MA below long MA = confirmed bearish
-      // structure at the entry timeframe).  EMA20 above EMA50 on 5m means the
-      // entry TF is still in an uptrend — shorting against it has historically
-      // produced the March "caught in a breakout" losses.
-      const e50_5m       = ema(closes, 50);
-      const emaStackShort = e50_5m != null && e20_5m != null && e20_5m < e50_5m;
-
-      // ── Guard 4: ATR expansion guard ────────────────────────────────────────
-      // Block SHORT when the current 5m ATR is > 130% of its recent 5-bar
-      // average.  Expanding ATR = breakout / momentum surge in progress.
-      // Shorting into an ATR expansion is the highest-risk scenario:
-      // the price is moving fast in SOME direction and the direction is
-      // ambiguous until the candle closes — whichever way it resolves, a
-      // short entry into expanding volatility faces wide slippage and
-      // immediate stop-loss risk.
-      let atrExpanding = false;
-      {
-        const atrNow = atrClose(closes, 14);
-        if (atrNow != null) {
-          const prevAtrs: number[] = [];
-          for (let i = 1; i <= 5; i++) {
-            const a = atrClose(closes.slice(0, closes.length - i), 14);
-            if (a != null) prevAtrs.push(a);
-          }
-          if (prevAtrs.length >= 3) {
-            const atrAvg = prevAtrs.reduce((a, b) => a + b, 0) / prevAtrs.length;
-            atrExpanding = atrNow > atrAvg * 1.30;   // 30% above recent average
-          }
-        }
-      }
-      const atrGuardOk = !atrExpanding;
-
       // ── Guard 5: Vote threshold (same as LONG) ──────────────────────────────
       // SHORT uses same threshold as LONG (VOTE_REQUIRED = 5).
       // The signal quality guards (EMA stack, ADX, ATR, session) already
@@ -1405,7 +1407,7 @@ function computeVotesFork(
       shortVotes += 2;                              // direction weight (VWAP+slope regime)
       const pullbackOk = recentMax >= 45;           // RSI rose above mid
       if (pullbackOk) shortVotes += 1;
-      const momentumOk = d != null && k < d && k <= 60 && pullbackOk;
+      const momentumOk = d != null && k < d && k <= 50 && rsiFalling;
       const triggerOk  = crossDown || leftOB || momentumOk;
       if (triggerOk) shortVotes += 2;
       const timingOk = rsiFalling;
@@ -1419,7 +1421,7 @@ function computeVotesFork(
       const reason =
         `Trend SHORT. pullbackOk=${pullbackOk} triggerOk=${triggerOk}(${triggerSrc}) ` +
         `rsiFalling=${timingOk} ema20=${priceBelowEma20} ` +
-        `emaStack=${emaStackShort} adx=${adxVal != null ? adxVal.toFixed(1) : "n/a"}(ok=${adxOk}) ` +
+        `emaStack=${emaStackShort} adx=${adxVal != null ? adxVal.toFixed(1) : "n/a"}(ok=${shortAdxOk}) ` +
         `atrExpanding=${atrExpanding}(ok=${atrGuardOk}) timeOk=${shortTimeOk} ` +
         `volOk=${volOk} bearDiv=${bearDiv} atResistance=${atResistance} ` +
         `votes=${shortVotes}/${shortRequired}`;
@@ -1429,7 +1431,7 @@ function computeVotesFork(
         shortVotes >= shortRequired &&
         shortVotes > longVotes &&
         emaStackShort      &&   // Guard 3: 5m EMA stack is bearish
-        adxOk              &&   // Guard 2: ADX ≥ 20 (or unavailable)
+        shortAdxOk         &&   // Guard 2: ADX ≥ 20 (or unavailable)
         atrGuardOk         &&   // Guard 4: ATR not expanding
         shortTimeOk             // Guard 1: London/NY session only
           ? "SHORT"
@@ -1446,14 +1448,14 @@ function computeVotesFork(
   const bullRejection = last > prev;
   const bearRejection = last < prev;
 
-  const longLocationOk = (nearSupport || touchLowerBB) && r <= 35;
-  const shortLocationOk = (nearResistance || touchUpperBB) && r >= 65;
+  const longLocationOk = (nearSupport || touchLowerBB) && r <= 30;
+  const shortLocationOk = (nearResistance || touchUpperBB) && r >= 70;
 
   const longTriggerOk = (crossUp || leftOS) && bullRejection;
   const shortTriggerOk = (crossDown || leftOB) && bearRejection;
 
-  const rangeLong = longLocationOk && longTriggerOk;
-  const rangeShort = shortLocationOk && shortTriggerOk;
+  const rangeLong = longLocationOk && longTriggerOk && rangeAdxOk;
+  const rangeShort = shortLocationOk && shortTriggerOk && rangeAdxOk;
 
   // Range fires at full strength (5 votes) when all conditions met
   longVotes = rangeLong ? 5 : 0;
@@ -1467,6 +1469,7 @@ function computeVotesFork(
   const reason =
     `Range (regime NONE). longLoc=${longLocationOk} longTrig=${longTriggerOk} ` +
     `shortLoc=${shortLocationOk} shortTrig=${shortTriggerOk} ` +
+    `adx=${adxVal != null ? adxVal.toFixed(1) : "n/a"}(ok=${rangeAdxOk}) ` +
     `nearSup=${nearSupport} touchLB=${touchLowerBB} nearRes=${nearResistance} touchUB=${touchUpperBB} ` +
     `rsi=${r.toFixed(2)} crossUp=${crossUp} leftOS=${leftOS} crossDown=${crossDown} leftOB=${leftOB}`;
 
