@@ -169,6 +169,7 @@ import type { Wad } from "./wad.js";
 const REVERT_MAP: Array<[string, RevertAction]> = [
   // Vault-specific reverts
   ["cooldown",                    "cooldown"],
+  ["pos already open",            "abort"],
   ["position already open",       "abort"],
   ["max open positions",          "abort"],
   ["market not enabled",          "abort"],
