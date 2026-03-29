@@ -2212,6 +2212,69 @@ function ForgotPasswordPage({ onBack }: { onBack: () => void }) {
   );
 }
 
+// ── Email Verification Page ──────────────────────────────────────────────────
+
+function VerifyEmailPage({ onBack }: { onBack: () => void }) {
+  const token = new URLSearchParams(window.location.search).get("token") ?? "";
+  const [loading, setLoading] = useState(true);
+  const [ok, setOk] = useState(false);
+  const [message, setMessage] = useState("Verifying your email address...");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function verify() {
+      if (!token) {
+        if (!cancelled) {
+          setOk(false);
+          setMessage("Missing verification token.");
+          setLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const r = await fetch(`/api/auth/verify-email?token=${encodeURIComponent(token)}`);
+        const d = await r.json();
+        if (cancelled) return;
+        setOk(!!d.ok);
+        setMessage(d.message ?? d.error ?? "Verification failed");
+      } catch {
+        if (cancelled) return;
+        setOk(false);
+        setMessage("Network error while verifying email.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    verify();
+    return () => { cancelled = true; };
+  }, [token]);
+
+  return (
+    <div className="login-overlay">
+      <div className="login-card" style={{ textAlign: "center" }}>
+        <div className="login-logo">
+          {loading ? <RefreshCw size={36} className="spin" style={{ color: "var(--teal)" }} /> : ok ? <CheckCircle size={36} style={{ color: "var(--teal)" }} /> : <AlertTriangle size={36} style={{ color: "#F59E0B" }} />}
+          <h1>{loading ? "Verifying Email" : ok ? "Email Verified" : "Verification Failed"}</h1>
+        </div>
+        <p style={{ color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
+          {message}
+        </p>
+        {!loading && ok && (
+          <div style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 16 }}>
+            Your account is now pending admin approval. You will receive another email once approved.
+          </div>
+        )}
+        <button onClick={onBack} className="action-btn start-btn" style={{ width: "100%", justifyContent: "center" }}>
+          Back to Login
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Pending Approval Page ─────────────────────────────────────────────────────
 
 function PendingApprovalPage({ onBack }: { onBack?: () => void }) {
@@ -2416,9 +2479,12 @@ export default function App() {
   // ── Auth ──
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
   const [userWallet, setUserWallet] = useState<string>("");
-  const [authView, setAuthView] = useState<"login" | "register" | "forgot">(() => {
+  const [authView, setAuthView] = useState<"login" | "register" | "forgot" | "verify">(() => {
+    const path = window.location.pathname;
+    const hasToken = !!new URLSearchParams(window.location.search).get("token");
+    if (path === "/auth/verify-email") return "verify";
     // If URL has a reset token, go straight to forgot/reset flow
-    return new URLSearchParams(window.location.search).get("token") ? "forgot" : "login";
+    return hasToken ? "forgot" : "login";
   });
   // ── Risk disclaimer — shown once per browser after first login ──
   const [riskAccepted, setRiskAccepted] = useState<boolean>(() => !!localStorage.getItem(RISK_KEY));
@@ -2732,6 +2798,12 @@ export default function App() {
   if (!token) {
     if (authView === "register") {
       return <RegisterPage onBack={() => setAuthView("login")} onSuccess={() => setAuthView("login")} />;
+    }
+    if (authView === "verify") {
+      return <VerifyEmailPage onBack={() => {
+        window.history.replaceState({}, "", "/");
+        setAuthView("login");
+      }} />;
     }
     if (authView === "forgot") {
       return <ForgotPasswordPage onBack={() => setAuthView("login")} />;
