@@ -1065,6 +1065,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
                 "0x23c6a2c43f92acac35ed89f352fa5f2e30496347aeb1aafb8e0a14766b47dbf1": "RENDERUSDT",
                 "0x3db5e9fb22b6f66ce6550ab2b9d3872f875f575780c6abb9c95f9ce03845a83e": "SOLUSDT",
                 "0xaeee40e849f19d8b8252d9e750ed2ff6fa233c95aa4a1d3da9858a3b18ade5df": "BNBUSDT",
+                "0x214dda553a3e2a23944080bfcad3566db70ebe7a599389f0f9cf73f0cf03e933": "DOGEUSDT",
+                "0xd539aa86bfdb7866021d9acb33f386154ce8e1719fb92d9179a1d314238b9ad0": "LINKUSDT",
               };
               const symbol    = MARKET_SYMBOLS[marketId] ?? null;
               // Try WS cache first; fall back to Binance Futures REST

@@ -133,6 +133,7 @@ const MARKET_SYMBOLS: Record<string, string> = {
   "0xaeee40e849f19d8b8252d9e750ed2ff6fa233c95aa4a1d3da9858a3b18ade5df": "BNBUSDT",
   "0x71083fc4de82d2f809bbb2c7b8c8b820d59abbbbd74f8a21d418fb9b990e325b": "XRPUSDT",
   "0x214dda553a3e2a23944080bfcad3566db70ebe7a599389f0f9cf73f0cf03e933": "DOGEUSDT",
+  "0x73afef6b6e9182f4df3f8b535ed73597e83bf2f35c74af4256eec00b2e2c1d8e": "LINKUSDT",
 };
 
 function marketIdToSymbol(id: string): string {
@@ -1109,7 +1110,7 @@ function BacktestPanel({ defaultSymbols }: { defaultSymbols: string[] }) {
         <div className="bt-field">
           <label>Symbol</label>
           <select className="bt-input" value={symbol} onChange={e => setSymbol(e.target.value)}>
-            {(defaultSymbols.length ? defaultSymbols : ["BTCUSDT","ETHUSDT","TAOUSDT","RENDERUSDT"]).map(s => (
+            {(defaultSymbols.length ? defaultSymbols : ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","DOGEUSDT","LINKUSDT"]).map(s => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
@@ -1210,6 +1211,7 @@ const SYMBOL_MAX_LEV: Record<string, number> = {
   BNBUSDT:     75,
   XRPUSDT:     50,
   DOGEUSDT:    25,
+  LINKUSDT:    50,
 };
 
 function getMaxLev(symbols: string[]): number {
@@ -3366,7 +3368,7 @@ export default function App() {
 
         {activeTab === "backtest" && (
           <Card title="Strategy Backtester" icon={<TrendingDown size={16} />}>
-            <BacktestPanel defaultSymbols={config?.symbols ?? ["BTCUSDT","ETHUSDT","TAOUSDT","RENDERUSDT"]} />
+            <BacktestPanel defaultSymbols={config?.symbols ?? ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","DOGEUSDT","LINKUSDT"]} />
           </Card>
         )}
 

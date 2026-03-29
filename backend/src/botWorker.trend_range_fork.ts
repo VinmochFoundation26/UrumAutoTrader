@@ -30,6 +30,7 @@ export const SYMBOL_MAX_LEVERAGE: Record<string, number> = {
   BNBUSDT:     75,
   XRPUSDT:     50,
   DOGEUSDT:    25,
+  LINKUSDT:    50,
 };
 
 /** Hard cap for a given symbol.  Falls back to 20x for unknown symbols. */

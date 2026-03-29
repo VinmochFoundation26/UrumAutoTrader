@@ -131,7 +131,7 @@ function StatusBadge({ status }: { status: UserStatus }) {
 
 // ── Trading Config Editor ─────────────────────────────────────────────────────
 
-const KNOWN_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","TAOUSDT","RENDERUSDT"];
+const KNOWN_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","LINKUSDT"];
 
 function TradingConfigEditor({ user, onClose, onSaved }: {
   user: AppUser;
