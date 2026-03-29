@@ -274,12 +274,17 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
       if (u.pathname === "/health") {
         let redisOk = false;
         try { await getRedis().ping(); redisOk = true; } catch { /* non-fatal */ }
+        const activeWorkers = workerPool.size;
+        const workerPoolRunning = workerPool.hasActiveWorkers;
         return json(res, 200, {
           ok: true,
           version: "1.1.0",
           uptime: Math.floor(process.uptime()),
           redis: redisOk ? "ok" : "degraded",
-          bot: getState().running ? "running" : "stopped",
+          bot: workerPoolRunning ? "running" : (getState().running ? "running" : "stopped"),
+          activeWorkers,
+          workerPoolRunning,
+          legacyBotRunning: getState().running,
           ts: Date.now(),
         });
       }
@@ -921,7 +926,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           const userKey = await resolveUserKey(req, u);
           if (!userKey) return json(res, 400, { ok: false, error: "no user configured" });
           const r = workerPool.stopUser(userKey);
-          return json(res, 200, r);
+          return json(res, r.ok ? 200 : 409, r);
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
@@ -994,7 +999,7 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
           const r = workerPool.stopUser(userKey);
           await getRedis().del("bot:engine:autostart");
           await auditLog(adminResult.userId, "pool:stop", userKey);
-          return json(res, 200, r);
+          return json(res, r.ok ? 200 : 409, r);
         } catch (e: any) {
           return json(res, 500, { ok: false, error: e?.message ?? String(e) });
         }
@@ -1060,6 +1065,8 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
                 "0x23c6a2c43f92acac35ed89f352fa5f2e30496347aeb1aafb8e0a14766b47dbf1": "RENDERUSDT",
                 "0x3db5e9fb22b6f66ce6550ab2b9d3872f875f575780c6abb9c95f9ce03845a83e": "SOLUSDT",
                 "0xaeee40e849f19d8b8252d9e750ed2ff6fa233c95aa4a1d3da9858a3b18ade5df": "BNBUSDT",
+                "0x214dda553a3e2a23944080bfcad3566db70ebe7a599389f0f9cf73f0cf03e933": "DOGEUSDT",
+                "0xd539aa86bfdb7866021d9acb33f386154ce8e1719fb92d9179a1d314238b9ad0": "LINKUSDT",
               };
               const symbol    = MARKET_SYMBOLS[marketId] ?? null;
               // Try WS cache first; fall back to Binance Futures REST
@@ -1728,7 +1735,13 @@ export async function handleRequest(req: http.IncomingMessage, res: http.ServerR
         return json(res, 200, {
           ok: true,
           services: {
-            bot:   { status: botState.running ? "operational" : "stopped", running: botState.running },
+            bot:   {
+              status: workerPool.hasActiveWorkers || botState.running ? "operational" : "stopped",
+              running: workerPool.hasActiveWorkers || botState.running,
+              activeWorkers: workerPool.size,
+              workerPoolRunning: workerPool.hasActiveWorkers,
+              legacyBotRunning: botState.running,
+            },
             redis: { status: redisOk ? "operational" : "degraded" },
             chain: { status: chainOk ? "operational" : "degraded", blockNumber },
           },

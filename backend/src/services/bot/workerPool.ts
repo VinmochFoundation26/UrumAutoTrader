@@ -182,6 +182,11 @@ class WorkerPool {
   get size(): number {
     return this.pool.size;
   }
+
+  /** True when any user worker is active in the pool. */
+  get hasActiveWorkers(): boolean {
+    return this.pool.size > 0;
+  }
 }
 
 // ── Singleton export ──────────────────────────────────────────────────────────

@@ -133,6 +133,7 @@ const MARKET_SYMBOLS: Record<string, string> = {
   "0xaeee40e849f19d8b8252d9e750ed2ff6fa233c95aa4a1d3da9858a3b18ade5df": "BNBUSDT",
   "0x71083fc4de82d2f809bbb2c7b8c8b820d59abbbbd74f8a21d418fb9b990e325b": "XRPUSDT",
   "0x214dda553a3e2a23944080bfcad3566db70ebe7a599389f0f9cf73f0cf03e933": "DOGEUSDT",
+  "0x73afef6b6e9182f4df3f8b535ed73597e83bf2f35c74af4256eec00b2e2c1d8e": "LINKUSDT",
 };
 
 function marketIdToSymbol(id: string): string {
@@ -1109,7 +1110,7 @@ function BacktestPanel({ defaultSymbols }: { defaultSymbols: string[] }) {
         <div className="bt-field">
           <label>Symbol</label>
           <select className="bt-input" value={symbol} onChange={e => setSymbol(e.target.value)}>
-            {(defaultSymbols.length ? defaultSymbols : ["BTCUSDT","ETHUSDT","TAOUSDT","RENDERUSDT"]).map(s => (
+            {(defaultSymbols.length ? defaultSymbols : ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","DOGEUSDT","LINKUSDT"]).map(s => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
@@ -1210,6 +1211,7 @@ const SYMBOL_MAX_LEV: Record<string, number> = {
   BNBUSDT:     75,
   XRPUSDT:     50,
   DOGEUSDT:    25,
+  LINKUSDT:    50,
 };
 
 function getMaxLev(symbols: string[]): number {
@@ -2212,6 +2214,69 @@ function ForgotPasswordPage({ onBack }: { onBack: () => void }) {
   );
 }
 
+// ── Email Verification Page ──────────────────────────────────────────────────
+
+function VerifyEmailPage({ onBack }: { onBack: () => void }) {
+  const token = new URLSearchParams(window.location.search).get("token") ?? "";
+  const [loading, setLoading] = useState(true);
+  const [ok, setOk] = useState(false);
+  const [message, setMessage] = useState("Verifying your email address...");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function verify() {
+      if (!token) {
+        if (!cancelled) {
+          setOk(false);
+          setMessage("Missing verification token.");
+          setLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const r = await fetch(`/api/auth/verify-email?token=${encodeURIComponent(token)}`);
+        const d = await r.json();
+        if (cancelled) return;
+        setOk(!!d.ok);
+        setMessage(d.message ?? d.error ?? "Verification failed");
+      } catch {
+        if (cancelled) return;
+        setOk(false);
+        setMessage("Network error while verifying email.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    verify();
+    return () => { cancelled = true; };
+  }, [token]);
+
+  return (
+    <div className="login-overlay">
+      <div className="login-card" style={{ textAlign: "center" }}>
+        <div className="login-logo">
+          {loading ? <RefreshCw size={36} className="spin" style={{ color: "var(--teal)" }} /> : ok ? <CheckCircle size={36} style={{ color: "var(--teal)" }} /> : <AlertTriangle size={36} style={{ color: "#F59E0B" }} />}
+          <h1>{loading ? "Verifying Email" : ok ? "Email Verified" : "Verification Failed"}</h1>
+        </div>
+        <p style={{ color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
+          {message}
+        </p>
+        {!loading && ok && (
+          <div style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 16 }}>
+            Your account is now pending admin approval. You will receive another email once approved.
+          </div>
+        )}
+        <button onClick={onBack} className="action-btn start-btn" style={{ width: "100%", justifyContent: "center" }}>
+          Back to Login
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Pending Approval Page ─────────────────────────────────────────────────────
 
 function PendingApprovalPage({ onBack }: { onBack?: () => void }) {
@@ -2416,9 +2481,12 @@ export default function App() {
   // ── Auth ──
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
   const [userWallet, setUserWallet] = useState<string>("");
-  const [authView, setAuthView] = useState<"login" | "register" | "forgot">(() => {
+  const [authView, setAuthView] = useState<"login" | "register" | "forgot" | "verify">(() => {
+    const path = window.location.pathname;
+    const hasToken = !!new URLSearchParams(window.location.search).get("token");
+    if (path === "/auth/verify-email") return "verify";
     // If URL has a reset token, go straight to forgot/reset flow
-    return new URLSearchParams(window.location.search).get("token") ? "forgot" : "login";
+    return hasToken ? "forgot" : "login";
   });
   // ── Risk disclaimer — shown once per browser after first login ──
   const [riskAccepted, setRiskAccepted] = useState<boolean>(() => !!localStorage.getItem(RISK_KEY));
@@ -2686,20 +2754,27 @@ export default function App() {
           MAX_LEVERAGE: launchLeverage,
           MANUAL_SIZE_PCT: sizeMode === "manual" ? manualSizePct / 100 : 0,
           VOTE_REQUIRED: 5,
-          MIN_PROFIT_BEFORE_REVERSAL: 0.30,
+          MIN_PROFIT_BEFORE_REVERSAL: 0.03,
           EXIT_ON_PROFIT_REVERSAL: 0.03,
+          PROFIT_LOCK_GATE: 0.30,
         }),
       });
-      await apiFetch("/me/bot/start", { method: "POST" });
+      const startRes: any = await apiFetch("/me/bot/start", { method: "POST" });
+      if (startRes?.ok === false) throw new Error(startRes.error ?? "Failed to start bot");
       await fetchState();
+    } catch (e: any) {
+      alert(e?.message ?? "Failed to start bot");
     } finally { setActionLoading(false); }
   }
 
   async function handleStop() {
     setActionLoading(true);
     try {
-      await apiFetch("/me/bot/stop", { method: "POST" });
+      const stopRes: any = await apiFetch("/me/bot/stop", { method: "POST" });
+      if (stopRes?.ok === false) throw new Error(stopRes.error ?? "Failed to stop bot");
       await fetchState();
+    } catch (e: any) {
+      alert(e?.message ?? "Failed to stop bot");
     } finally { setActionLoading(false); }
   }
 
@@ -2725,6 +2800,12 @@ export default function App() {
   if (!token) {
     if (authView === "register") {
       return <RegisterPage onBack={() => setAuthView("login")} onSuccess={() => setAuthView("login")} />;
+    }
+    if (authView === "verify") {
+      return <VerifyEmailPage onBack={() => {
+        window.history.replaceState({}, "", "/");
+        setAuthView("login");
+      }} />;
     }
     if (authView === "forgot") {
       return <ForgotPasswordPage onBack={() => setAuthView("login")} />;
@@ -3287,7 +3368,7 @@ export default function App() {
 
         {activeTab === "backtest" && (
           <Card title="Strategy Backtester" icon={<TrendingDown size={16} />}>
-            <BacktestPanel defaultSymbols={config?.symbols ?? ["BTCUSDT","ETHUSDT","TAOUSDT","RENDERUSDT"]} />
+            <BacktestPanel defaultSymbols={config?.symbols ?? ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","DOGEUSDT","LINKUSDT"]} />
           </Card>
         )}
 

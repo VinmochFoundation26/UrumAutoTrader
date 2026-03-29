@@ -73,6 +73,19 @@ export function makeEngineDeps() {
       }
 
       const marketId = symbolToMarketId(symbol);
+      // ── Pre-check: skip if this exact market is already open on-chain ───────
+      // openCount alone is not enough; we need to guard per-symbol duplicate entry
+      // so the UI does not surface a revert like "pos already open".
+      try {
+        const pos = await (vault as any).positionOf(userKey, marketId);
+        if (pos?.isOpen) {
+          log.debug({ symbol, userKey }, "[deps] market already open on-chain, skipping entry");
+          return { skipped: true, reason: "position_already_open" };
+        }
+      } catch {
+        // If the view call fails, proceed optimistically (don't block entry)
+      }
+
       // sizeWad is x18; divide by leverage → collateralX18; divide by 10^12 → raw 6-dec USDC
       const collateralRaw = sizeWad / BigInt(leverage) / (10n ** 12n);
 
